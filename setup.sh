@@ -227,7 +227,7 @@ setup_firewall() {
     for p in "${ports[@]}"; do
       p="$(echo "$p" | tr -d ' ')"
       [[ -z "$p" ]] && continue
-      ufw allow "$p"/tcp comment 'node' >/dev/null
+      ufw allow "$p/tcp" comment 'node' >/dev/null
       log "Открыт порт: $p"
     done
   else
