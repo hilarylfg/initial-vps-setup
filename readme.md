@@ -59,7 +59,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/hilarylfg/initial-vps-setup/
 Типовой запуск с портами:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/USERNAME/REPO/main/setup.sh) \
+bash <(curl -fsSL https://raw.githubusercontent.com/hilarylfg/initial-vps-setup/main/setup.sh) \
      --ssh-port 2222 \
      --ports 443,8443 \
      --timezone Europe/Moscow
