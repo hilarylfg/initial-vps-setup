@@ -36,7 +36,7 @@ usage() {
 Использование: bash setup.sh [опции]
 
   --ssh-port PORT          сменить порт SSH (например 2222)
-  --ports 443,8443         открыть порты ноды в фаерволе
+  --ports 443,8443         открыть порты в фаерволе
   --timezone Europe/Moscow установить таймзону
   --no-docker              не ставить Docker
   --no-fail2ban            пропустить fail2ban
@@ -113,28 +113,59 @@ set_timezone() {
   log "Время: $(date '+%F %T %Z')"
 }
 
-disable_ipv6() {
-  step "Отключение IPv6"
-  cat > /etc/sysctl.d/99-disable-ipv6.conf <<'EOF'
+tune_network() {
+  step "Настройка сети: BBR, IPv6, ping, буферы TCP"
+
+  local sysctl_conf="/etc/sysctl.conf"
+  local sysctl_backup="${sysctl_conf}.backup.$(date +%s)"
+  cp "$sysctl_conf" "$sysctl_backup"
+
+  local patterns=(
+    "net.ipv6.conf.all.disable_ipv6"
+    "net.ipv6.conf.default.disable_ipv6"
+    "net.ipv6.conf.lo.disable_ipv6"
+    "net.ipv4.icmp_echo_ignore_all"
+    "net.core.default_qdisc"
+    "net.ipv4.tcp_congestion_control"
+    "net.core.rmem_default"
+    "net.core.wmem_default"
+    "net.core.rmem_max"
+    "net.core.wmem_max"
+    "net.ipv4.tcp_rmem"
+    "net.ipv4.tcp_wmem"
+    "net.ipv4.tcp_fastopen"
+    "net.ipv4.tcp_slow_start_after_idle"
+    "net.ipv4.tcp_mtu_probing"
+    "net.ipv4.tcp_notsent_lowat"
+    "net.core.somaxconn"
+    "net.core.netdev_max_backlog"
+    "net.ipv4.tcp_max_syn_backlog"
+    "net.ipv4.tcp_max_tw_buckets"
+    "net.ipv4.tcp_fin_timeout"
+    "net.ipv4.ip_forward"
+    "fs.file-max"
+    "vm.swappiness"
+  )
+
+  for pattern in "${patterns[@]}"; do
+    sed -i "/^${pattern//./\.}/d" "$sysctl_conf"
+  done
+
+  cat >> "$sysctl_conf" <<'EOF'
+
+# --- IPv6 (отключение) ---
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 1
-EOF
-  sysctl -p /etc/sysctl.d/99-disable-ipv6.conf >/dev/null 2>&1 || true
-  log "IPv6 отключён (до конца применится после перезагрузки)"
-}
 
-tune_network() {
-  step "Сеть: BBR + тюнинг TCP"
-  modprobe tcp_bbr 2>/dev/null || true
-  echo "tcp_bbr" > /etc/modules-load.d/tcp_bbr.conf
+# --- Блокировка входящего ping (ICMP) ---
+net.ipv4.icmp_echo_ignore_all = 1
 
-  cat > /etc/sysctl.d/99-vpn-tune.conf <<'EOF'
-# --- BBR ---
+# --- BBR congestion control ---
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 
-# --- Буферы TCP (важно для скорости через прокси) ---
+# --- Буферы TCP (для стабильности и скорости) ---
 net.core.rmem_default = 1048576
 net.core.wmem_default = 1048576
 net.core.rmem_max = 33554432
@@ -142,7 +173,7 @@ net.core.wmem_max = 33554432
 net.ipv4.tcp_rmem = 4096 87380 33554432
 net.ipv4.tcp_wmem = 4096 16384 33554432
 
-# --- TCP не «остывает» после простоя + MTU probing (для туннелей) ---
+# --- TCP оптимизация ---
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_mtu_probing = 1
@@ -160,9 +191,30 @@ net.ipv4.ip_forward = 1
 fs.file-max = 2097152
 vm.swappiness = 10
 EOF
-  sysctl -p /etc/sysctl.d/99-vpn-tune.conf >/dev/null 2>&1 || true
 
-  cat > /etc/security/limits.d/99-vpn.conf <<'EOF'
+  sysctl -p >/dev/null 2>&1 || true
+
+  if sysctl -n net.ipv4.tcp_congestion_control | grep -q bbr; then
+    log "BBR включён"
+  else
+    warn "BBR не применился — проверь версию ядра (нужна 4.9+)"
+  fi
+
+  if [[ $(cat /proc/sys/net/ipv6/conf/all/disable_ipv6) -eq 1 ]]; then
+    log "IPv6 отключён"
+  else
+    warn "IPv6 не отключился при первом применении — требуется перезагрузка"
+  fi
+
+  if [[ $(cat /proc/sys/net/ipv4/icmp_echo_ignore_all) -eq 1 ]]; then
+    log "Входящий ping заблокирован"
+  fi
+
+  modprobe tcp_bbr 2>/dev/null || true
+  echo "tcp_bbr" > /etc/modules-load.d/tcp_bbr.conf 2>/dev/null || true
+
+  mkdir -p /etc/security/limits.d
+  cat > /etc/security/limits.d/99-increase-limits.conf <<'EOF'
 * soft nofile 1048576
 * hard nofile 1048576
 root soft nofile 1048576
@@ -176,20 +228,7 @@ SystemMaxUse=200M
 EOF
   systemctl restart systemd-journald 2>/dev/null || true
 
-  if sysctl -n net.ipv4.tcp_congestion_control | grep -q bbr; then
-    log "BBR включён"
-  else
-    warn "BBR не применился — проверь версию ядра (нужна 4.9+)"
-  fi
-}
-
-block_ping() {
-  step "Блокировка ping (ICMP)"
-  cat > /etc/sysctl.d/99-block-ping.conf <<'EOF'
-net.ipv4.icmp_echo_ignore_all = 1
-EOF
-  sysctl -p /etc/sysctl.d/99-block-ping.conf >/dev/null 2>&1 || true
-  log "Сервер больше не отвечает на ping снаружи (исходящий ping работает)"
+  log "Все сетевые параметры применены"
 }
 
 setup_fail2ban() {
@@ -227,7 +266,7 @@ setup_firewall() {
     for p in "${ports[@]}"; do
       p="$(echo "$p" | tr -d ' ')"
       [[ -z "$p" ]] && continue
-      ufw allow "$p/tcp" comment 'node' >/dev/null
+      ufw allow "$p/tcp" comment 'application' >/dev/null
       log "Открыт порт: $p"
     done
   else
@@ -359,9 +398,7 @@ main() {
   update_system
   install_base
   set_timezone
-  $DISABLE_IPV6 && disable_ipv6
   tune_network
-  $BLOCK_PING && block_ping
   $SKIP_FAIL2BAN || setup_fail2ban
   setup_firewall
   configure_ssh
