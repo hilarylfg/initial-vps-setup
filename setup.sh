@@ -97,7 +97,7 @@ update_system() {
 install_base() {
   step "Базовые пакеты"
   apt-get install -y \
-    curl wget git jq unzip ca-certificates socat cron \
+    curl wget git jq unzip ca-certificates socat cron procps \
     htop vnstat mtr-tiny iperf3 netcat-openbsd speedtest-cli \
     ufw fail2ban
   systemctl enable --now vnstat >/dev/null 2>&1 || true
@@ -114,58 +114,17 @@ set_timezone() {
 }
 
 tune_network() {
-  step "Настройка сети: BBR, IPv6, ping, буферы TCP"
+  step "Настройка сети: BBR, буферы TCP, IPv6, ping"
 
-  local sysctl_conf="/etc/sysctl.conf"
-  local sysctl_backup="${sysctl_conf}.backup.$(date +%s)"
-  cp "$sysctl_conf" "$sysctl_backup"
+  modprobe tcp_bbr 2>/dev/null || true
+  echo "tcp_bbr" > /etc/modules-load.d/tcp_bbr.conf 2>/dev/null || true
 
-  local patterns=(
-    "net.ipv6.conf.all.disable_ipv6"
-    "net.ipv6.conf.default.disable_ipv6"
-    "net.ipv6.conf.lo.disable_ipv6"
-    "net.ipv4.icmp_echo_ignore_all"
-    "net.core.default_qdisc"
-    "net.ipv4.tcp_congestion_control"
-    "net.core.rmem_default"
-    "net.core.wmem_default"
-    "net.core.rmem_max"
-    "net.core.wmem_max"
-    "net.ipv4.tcp_rmem"
-    "net.ipv4.tcp_wmem"
-    "net.ipv4.tcp_fastopen"
-    "net.ipv4.tcp_slow_start_after_idle"
-    "net.ipv4.tcp_mtu_probing"
-    "net.ipv4.tcp_notsent_lowat"
-    "net.core.somaxconn"
-    "net.core.netdev_max_backlog"
-    "net.ipv4.tcp_max_syn_backlog"
-    "net.ipv4.tcp_max_tw_buckets"
-    "net.ipv4.tcp_fin_timeout"
-    "net.ipv4.ip_forward"
-    "fs.file-max"
-    "vm.swappiness"
-  )
-
-  for pattern in "${patterns[@]}"; do
-    sed -i "/^${pattern//./\.}/d" "$sysctl_conf"
-  done
-
-  cat >> "$sysctl_conf" <<'EOF'
-
-# --- IPv6 (отключение) ---
-net.ipv6.conf.all.disable_ipv6 = 1
-net.ipv6.conf.default.disable_ipv6 = 1
-net.ipv6.conf.lo.disable_ipv6 = 1
-
-# --- Блокировка входящего ping (ICMP) ---
-net.ipv4.icmp_echo_ignore_all = 1
-
+  cat > /etc/sysctl.d/99-vpn-tune.conf <<'EOF'
 # --- BBR congestion control ---
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 
-# --- Буферы TCP (для стабильности и скорости) ---
+# --- Буферы TCP ---
 net.core.rmem_default = 1048576
 net.core.wmem_default = 1048576
 net.core.rmem_max = 33554432
@@ -192,27 +151,45 @@ fs.file-max = 2097152
 vm.swappiness = 10
 EOF
 
-  sysctl -p >/dev/null 2>&1 || true
+  rm -f /etc/sysctl.d/99-disable-ipv6.conf /etc/sysctl.d/99-block-ping.conf
 
-  if sysctl -n net.ipv4.tcp_congestion_control | grep -q bbr; then
+  if $DISABLE_IPV6; then
+    cat > /etc/sysctl.d/99-disable-ipv6.conf <<'EOF'
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+EOF
+    log "IPv6: дроп-ин создан"
+  fi
+
+  if $BLOCK_PING; then
+    cat > /etc/sysctl.d/99-block-ping.conf <<'EOF'
+net.ipv4.icmp_echo_ignore_all = 1
+EOF
+    log "Ping: дроп-ин создан"
+  fi
+
+  sysctl --system >/dev/null 2>&1 || true
+
+  if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]]; then
     log "BBR включён"
   else
     warn "BBR не применился — проверь версию ядра (нужна 4.9+)"
   fi
 
-  if [[ $(cat /proc/sys/net/ipv6/conf/all/disable_ipv6) -eq 1 ]]; then
+  if [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" == "1" ]]; then
     log "IPv6 отключён"
-  else
-    warn "IPv6 не отключился при первом применении — требуется перезагрузка"
+  elif $DISABLE_IPV6; then
+    warn "IPv6 не отключился сейчас (частая история на LXC) — проверь после перезагрузки или отключи в панели провайдера"
   fi
 
-  if [[ $(cat /proc/sys/net/ipv4/icmp_echo_ignore_all) -eq 1 ]]; then
+  if [[ "$(cat /proc/sys/net/ipv4/icmp_echo_ignore_all 2>/dev/null)" == "1" ]]; then
     log "Входящий ping заблокирован"
+  elif $BLOCK_PING; then
+    warn "icmp_echo_ignore_all не применился (возможно, LXC) — проверь после перезагрузки"
   fi
 
-  modprobe tcp_bbr 2>/dev/null || true
-  echo "tcp_bbr" > /etc/modules-load.d/tcp_bbr.conf 2>/dev/null || true
-
+  # --- Лимиты дескрипторов ---
   mkdir -p /etc/security/limits.d
   cat > /etc/security/limits.d/99-increase-limits.conf <<'EOF'
 * soft nofile 1048576
