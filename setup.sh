@@ -10,16 +10,17 @@ set -euo pipefail
 
 #----------------------- НАСТРОЙКИ ------------------------------
 SSH_PORT=""
-OPEN_PORTS=""  
-TIMEZONE="" 
-INSTALL_DOCKER=true   
+OPEN_PORTS=""
+TIMEZONE=""
+INSTALL_DOCKER=true
 HARDEN_SSH=true
-DISABLE_IPV6=true
+DISABLE_IPV6=false
 BLOCK_PING=true
 SETUP_SWAP=true
 SKIP_FAIL2BAN=false
-PURGE_CLOUDINIT=false    
-DISABLE_SSH_PASSWORD=false 
+PURGE_CLOUDINIT=false
+DISABLE_SSH_PASSWORD=false
+LEGACY_CLEANED=false   
 
 #----------------------- ЛОГИ -----------------------------------
 G='\033[0;32m'; Y='\033[1;33m'; R='\033[0;31m'; C='\033[0;36m'; N='\033[0m'
@@ -36,11 +37,11 @@ usage() {
 Использование: bash setup.sh [опции]
 
   --ssh-port PORT          сменить порт SSH (например 2222)
-  --ports 443,8443         открыть порты в фаерволе
+  --ports 443,8443         открыть порты в фаерволе (tcp)
   --timezone Europe/Moscow установить таймзону
+  --disable-ipv6           отключить IPv6 (по умолчанию IPv6 остаётся включённым)
   --no-docker              не ставить Docker
   --no-fail2ban            пропустить fail2ban
-  --no-ipv6-off            НЕ отключать IPv6
   --no-block-ping          НЕ блокировать ответы на ping
   --no-swap                не создавать swap
   --no-ssh-harden          не трогать конфиг SSH
@@ -59,9 +60,9 @@ parse() {
       --ssh-port)             [[ -n "${2:-}" ]] || die "--ssh-port: укажи порт"; SSH_PORT="$2"; shift 2 ;;
       --ports)                [[ -n "${2:-}" ]] || die "--ports: укажи порты"; OPEN_PORTS="$2"; shift 2 ;;
       --timezone)             [[ -n "${2:-}" ]] || die "--timezone: укажи таймзону"; TIMEZONE="$2"; shift 2 ;;
+      --disable-ipv6)         DISABLE_IPV6=true; shift ;;
       --no-docker)            INSTALL_DOCKER=false; shift ;;
       --no-fail2ban)          SKIP_FAIL2BAN=true; shift ;;
-      --no-ipv6-off)          DISABLE_IPV6=false; shift ;;
       --no-block-ping)        BLOCK_PING=false; shift ;;
       --no-swap)              SETUP_SWAP=false; shift ;;
       --no-ssh-harden)        HARDEN_SSH=false; shift ;;
@@ -114,59 +115,63 @@ set_timezone() {
 }
 
 tune_network() {
-  step "Настройка сети: BBR, буферы TCP, IPv6, ping"
+  step "Сеть: только BBR (+ ping по флагам)"
 
   modprobe tcp_bbr 2>/dev/null || true
   echo "tcp_bbr" > /etc/modules-load.d/tcp_bbr.conf 2>/dev/null || true
 
   cat > /etc/sysctl.d/99-vpn-tune.conf <<'EOF'
-# --- BBR congestion control ---
+# Только BBR. Остальной тюнинг (буферы, fastopen, очереди и т.д.) убран:
+# дефолтов ядра достаточно, а нестандартные значения могли вызывать
+# нестабильность соединений на некоторых клиентах.
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
-
-# --- Буферы TCP ---
-net.core.rmem_default = 1048576
-net.core.wmem_default = 1048576
-net.core.rmem_max = 33554432
-net.core.wmem_max = 33554432
-net.ipv4.tcp_rmem = 4096 87380 33554432
-net.ipv4.tcp_wmem = 4096 16384 33554432
-
-# --- TCP оптимизация ---
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_notsent_lowat = 131072
-
-# --- Очереди соединений ---
-net.core.somaxconn = 8192
-net.core.netdev_max_backlog = 16384
-net.ipv4.tcp_max_syn_backlog = 8192
-net.ipv4.tcp_max_tw_buckets = 32768
-net.ipv4.tcp_fin_timeout = 15
-
-# --- Разное ---
-net.ipv4.ip_forward = 1
-fs.file-max = 2097152
-vm.swappiness = 10
 EOF
 
-  rm -f /etc/sysctl.d/99-disable-ipv6.conf /etc/sysctl.d/99-block-ping.conf
+  local key
+  local legacy_keys=(
+    net.core.rmem_default net.core.wmem_default net.core.rmem_max net.core.wmem_max
+    net.ipv4.tcp_rmem net.ipv4.tcp_wmem
+    net.ipv4.tcp_fastopen net.ipv4.tcp_slow_start_after_idle
+    net.ipv4.tcp_mtu_probing net.ipv4.tcp_notsent_lowat
+    net.core.somaxconn net.core.netdev_max_backlog
+    net.ipv4.tcp_max_syn_backlog net.ipv4.tcp_max_tw_buckets net.ipv4.tcp_fin_timeout
+    net.ipv4.ip_forward fs.file-max vm.swappiness
+    net.ipv4.icmp_echo_ignore_all
+    net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6 net.ipv6.conf.lo.disable_ipv6
+    net.core.default_qdisc net.ipv4.tcp_congestion_control
+  )
+  for key in "${legacy_keys[@]}"; do
+    if grep -qE "^${key//./\\.}[[:space:]]*=" /etc/sysctl.conf 2>/dev/null; then
+      sed -i "/^${key//./\\.}[[:space:]]*=/d" /etc/sysctl.conf
+      LEGACY_CLEANED=true
+    fi
+  done
+  if $LEGACY_CLEANED; then
+    warn "Из /etc/sysctl.conf удалён тюнинг от старой версии скрипта."
+    warn "Перезагрузи сервер (reboot) после работы скрипта, чтобы сбросились старые значения ядра."
+  fi
 
+  rm -f /etc/sysctl.d/99-disable-ipv6.conf
   if $DISABLE_IPV6; then
     cat > /etc/sysctl.d/99-disable-ipv6.conf <<'EOF'
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 1
 EOF
-    log "IPv6: дроп-ин создан"
+    log "IPv6: отключаю (--disable-ipv6)"
+  else
+    sysctl -w net.ipv6.conf.all.disable_ipv6=0     >/dev/null 2>&1 || true
+    sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1 || true
+    sysctl -w net.ipv6.conf.lo.disable_ipv6=0      >/dev/null 2>&1 || true
+    log "IPv6: оставляю включённым (по умолчанию)"
   fi
 
+  rm -f /etc/sysctl.d/99-block-ping.conf
   if $BLOCK_PING; then
     cat > /etc/sysctl.d/99-block-ping.conf <<'EOF'
 net.ipv4.icmp_echo_ignore_all = 1
 EOF
-    log "Ping: дроп-ин создан"
   fi
 
   sysctl --system >/dev/null 2>&1 || true
@@ -177,10 +182,20 @@ EOF
     warn "BBR не применился — проверь версию ядра (нужна 4.9+)"
   fi
 
-  if [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" == "1" ]]; then
-    log "IPv6 отключён"
-  elif $DISABLE_IPV6; then
-    warn "IPv6 не отключился сейчас (частая история на LXC) — проверь после перезагрузки или отключи в панели провайдера"
+  local ipv6_off
+  ipv6_off="$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 0)"
+  if $DISABLE_IPV6; then
+    if [[ "$ipv6_off" == "1" ]]; then
+      log "IPv6 отключён"
+    else
+      warn "IPv6 не отключился (частая история на LXC) — проверь после перезагрузки или в панели хостера"
+    fi
+  else
+    if [[ "$ipv6_off" == "0" ]]; then
+      log "IPv6 включён"
+    else
+      warn "IPv6 сейчас отключён (остаток прошлых запусков/настройки хостера). Дроп-ин удалён — после перезагрузки IPv6 вернётся"
+    fi
   fi
 
   if [[ "$(cat /proc/sys/net/ipv4/icmp_echo_ignore_all 2>/dev/null)" == "1" ]]; then
@@ -188,8 +203,10 @@ EOF
   elif $BLOCK_PING; then
     warn "icmp_echo_ignore_all не применился (возможно, LXC) — проверь после перезагрузки"
   fi
+}
 
-  # --- Лимиты дескрипторов ---
+system_limits() {
+  step "Системные лимиты и журнал"
   mkdir -p /etc/security/limits.d
   cat > /etc/security/limits.d/99-increase-limits.conf <<'EOF'
 * soft nofile 1048576
@@ -204,8 +221,7 @@ EOF
 SystemMaxUse=200M
 EOF
   systemctl restart systemd-journald 2>/dev/null || true
-
-  log "Все сетевые параметры применены"
+  log "Лимиты и размер журнала настроены"
 }
 
 setup_fail2ban() {
@@ -244,10 +260,10 @@ setup_firewall() {
       p="$(echo "$p" | tr -d ' ')"
       [[ -z "$p" ]] && continue
       ufw allow "$p/tcp" comment 'application' >/dev/null
-      log "Открыт порт: $p"
+      log "Открыт порт: $p/tcp"
     done
   else
-    warn "Порты не указаны (--ports). Не забудь открыть позже: ufw allow ПОРТ"
+    warn "Порты не указаны (--ports). Не забудь открыть позже: ufw allow ПОРТ/tcp"
   fi
 
   ufw default deny incoming
@@ -287,8 +303,8 @@ configure_ssh() {
         read -r -p "Отключить вход по паролю (только SSH-ключи)? [y/N]: " ans </dev/tty 2>/dev/null || ans="n"
       fi
       if [[ "$ans" =~ ^[Yy]$ ]]; then
-        echo "PasswordAuthentication no"      >> "$cfg"
-        echo "PermitRootLogin prohibit-password" >> "$cfg"
+        echo "PasswordAuthentication no"          >> "$cfg"
+        echo "PermitRootLogin prohibit-password"  >> "$cfg"
         log "Вход по паролю отключён"
       fi
     else
@@ -342,7 +358,7 @@ cleanup() {
 }
 
 install_docker() {
-  $INSTALL_DOCKER || return 0
+  if ! $INSTALL_DOCKER; then return 0; fi
   step "Docker"
   if command -v docker >/dev/null 2>&1; then
     log "Docker уже установлен: $(docker --version)"
@@ -364,10 +380,10 @@ summary() {
   echo -e "Fail2ban:     $(systemctl is-active fail2ban 2>/dev/null || echo 'выключен')"
   echo -e "UFW:          $(ufw status 2>/dev/null | head -n1 | awk '{print $2}')"
   echo -e "Docker:       $(command -v docker >/dev/null 2>&1 && docker --version || echo 'нет')"
+  if $LEGACY_CLEANED; then
+    echo -e "${Y}Внимание:    удалён старый тюнинг из /etc/sysctl.conf — рекомендуется reboot${N}"
+  fi
   echo -e "${C}══════════════════════════════════════════════${N}"
-  cat <<'EOF'
-
-EOF
 }
 
 main() {
@@ -376,10 +392,11 @@ main() {
   install_base
   set_timezone
   tune_network
+  system_limits
   $SKIP_FAIL2BAN || setup_fail2ban
   setup_firewall
   configure_ssh
-  $SETUP_SWAP && setup_swap
+  if $SETUP_SWAP; then setup_swap; fi
   cleanup
   install_docker
   summary
