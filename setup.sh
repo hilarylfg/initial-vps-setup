@@ -206,7 +206,9 @@ precheck() {
       *) warn "ОС '${ID:-?}' не тестировалась (ориентируюсь на Ubuntu/Debian). Продолжаю..." ;;
     esac
   fi
-  CURR_SSH_PORT="$(sshd -T 2>/dev/null | awk 'tolower($1)=="port"{print $2; exit}')"
+  # Определяем текущий порт sshd. Никак не должен остановить скрипт:
+  # ни зависнуть, ни упасть (странные конфиги/образы встречаются).
+  CURR_SSH_PORT="$(timeout 5 sshd -T 2>/dev/null | awk 'tolower($1)=="port"{print $2; exit}' || true)"
   CURR_SSH_PORT="${CURR_SSH_PORT:-22}"
 }
 
