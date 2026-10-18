@@ -27,6 +27,9 @@ SETUP_SWAP=true
 SKIP_FAIL2BAN=false
 PURGE_CLOUDINIT=false
 DISABLE_SSH_PASSWORD=false
+NO_UPDATE=false     # пропустить apt update/upgrade
+NO_FIREWALL=false   # не трогать UFW и порты вообще
+NO_SSH=false        # не менять настройки sshd вообще
 
 #----------------------- СОСТОЯНИЕ ------------------------------
 FLAGS_SEEN=" "
@@ -157,6 +160,9 @@ usage() {
                             (приватный ключ будет показан один раз)
   --hostname NAME           задать hostname
   --disable-ipv6            отключить IPv6 (по умолчанию остаётся включённым)
+  --no-update               не обновлять систему (apt update/upgrade)
+  --no-firewall             не трогать фаервол и порты: UFW остаётся как есть
+  --no-ssh                  не менять настройки sshd: порт, харденинг, пароли
   --no-docker               не ставить Docker
   --no-fail2ban             пропустить fail2ban
   --no-block-ping           НЕ блокировать ответы на ping
@@ -187,6 +193,9 @@ parse() {
       --generate-key)         ADMIN_KEY_MODE="generate"; FLAGS_SEEN+="generate-key "; shift ;;
       --hostname)             need "$1" "${2:-}"; HOSTNAME_NEW="$2"; FLAGS_SEEN+="hostname "; shift 2 ;;
       --disable-ipv6)         DISABLE_IPV6=true; FLAGS_SEEN+="disable-ipv6 "; shift ;;
+      --no-update)            NO_UPDATE=true; FLAGS_SEEN+="no-update "; shift ;;
+      --no-firewall)          NO_FIREWALL=true; FLAGS_SEEN+="no-firewall "; shift ;;
+      --no-ssh)               NO_SSH=true; FLAGS_SEEN+="no-ssh "; shift ;;
       --no-docker)            INSTALL_DOCKER=false; FLAGS_SEEN+="no-docker "; shift ;;
       --no-fail2ban)          SKIP_FAIL2BAN=true; FLAGS_SEEN+="no-fail2ban "; shift ;;
       --no-block-ping)        BLOCK_PING=false; FLAGS_SEEN+="no-block-ping "; shift ;;
@@ -266,6 +275,10 @@ precheck() {
 }
 
 update_system() {
+  if $NO_UPDATE; then
+    log "Обновление системы: пропущено"
+    return 0
+  fi
   step "Обновление системы"
   apt-get update -y
   apt-get -y -o Dpkg::Options::="--force-confold" upgrade
@@ -277,10 +290,11 @@ update_system() {
 
 install_base() {
   step "Базовые пакеты"
-  apt-get install -y \
-    curl wget git jq unzip ca-certificates socat cron procps sudo \
-    htop vnstat mtr-tiny iperf3 netcat-openbsd speedtest-cli \
-    ufw fail2ban
+  local pkgs="curl wget git jq unzip ca-certificates socat cron procps sudo"
+  pkgs+=" htop vnstat mtr-tiny iperf3 netcat-openbsd speedtest-cli fail2ban"
+  if ! $NO_FIREWALL; then pkgs+=" ufw"; fi
+  # shellcheck disable=SC2086  # список пакетов — намеренное разделение на слова
+  apt-get install -y $pkgs
   systemctl enable --now vnstat >/dev/null 2>&1 || true
   log "Базовые пакеты установлены"
 }
@@ -734,6 +748,10 @@ EOF
 }
 
 setup_firewall() {
+  if $NO_FIREWALL; then
+    log "Фаервол: не трогаю — правила и UFW остаются как есть"
+    return 0
+  fi
   step "Фаервол UFW"
   local ssh_p="${SSH_PORT:-$CURR_SSH_PORT}"
   ufw limit "${ssh_p}/tcp" comment 'SSH' >/dev/null
@@ -767,6 +785,10 @@ setup_firewall() {
 }
 
 configure_ssh() {
+  if $NO_SSH; then
+    log "SSH: конфиг sshd не трогаю"
+    return 0
+  fi
   step "SSH"
   local cfg=/etc/ssh/sshd_config.d/99-hardening.conf
   mkdir -p /etc/ssh/sshd_config.d
@@ -910,6 +932,18 @@ summary() {
 
 #----------------------- ВАЛИДАЦИЯ ОТВЕТОВ ----------------------
 validate_settings() {
+  if $NO_SSH; then
+    if [[ -n "$SSH_PORT" ]]; then
+      warn "--no-ssh: смену SSH-порта пропускаю"
+      SSH_PORT=""
+    fi
+    HARDEN_SSH=false
+    DISABLE_SSH_PASSWORD=false
+  fi
+  if $NO_FIREWALL && [[ -n "$OPEN_PORTS" ]]; then
+    warn "--no-firewall: список --ports игнорирую, фаервол не трогаю"
+    OPEN_PORTS=""
+  fi
   if [[ -n "$SSH_PORT" ]]; then
     is_valid_port "$SSH_PORT" || die "Порт SSH «$SSH_PORT» — не число из диапазона 1–65535"
     if [[ "$SSH_PORT" == "$CURR_SSH_PORT" ]]; then
@@ -1007,7 +1041,14 @@ wizard_questions() {
     done
   fi
 
-  if [[ -z "$SSH_PORT" ]]; then
+  if ! flag_seen "no-ssh"; then
+    ask_yes "Настраивать SSH (порт, харденинг, запрет паролей)?" y || NO_SSH=true
+  fi
+  if $NO_SSH; then
+    log "SSH: настройки sshd не трогаю"
+  fi
+
+  if ! $NO_SSH && [[ -z "$SSH_PORT" ]]; then
     local _p
     while true; do
       get_answer _p "Порт SSH (пусто — оставить $CURR_SSH_PORT)" ""
@@ -1063,40 +1104,50 @@ wizard_questions() {
     fi
   fi
 
-  port_survey_print
-
-  if ! flag_seen "ports"; then
-    local ext_tcp=0 ext_udp=0
-    count_external_ports ext_tcp ext_udp
-    local _choice
-    echo
-    log "Как поступить с портами для внешнего доступа?"
-    echo -e "  ${C}1${N} — открыть всё, что уже слушается извне (tcp: $ext_tcp, udp: $ext_udp)"
-    echo -e "  ${C}2${N} — задать список вручную (порт[/tcp|udp|both] или диапазон 30000-40000/udp, через запятую)"
-    echo -e "  ${C}3${N} — ничего не открывать"
-    local def="1"
-    if (( ext_tcp + ext_udp == 0 )); then def="2"; fi
-    while true; do
-      get_answer _choice "Выбор" "$def"
-      case "$_choice" in
-        1)
-          if (( ext_tcp + ext_udp > 0 )); then collect_external_ports; else OPEN_PORTS=""; fi
-          break ;;
-        2)
-          get_answer OPEN_PORTS "Порты (например 443/tcp,8443/udp,30000-40000/udp)" ""
-          OPEN_PORTS="${OPEN_PORTS// /}"
-          break ;;
-        3)
-          OPEN_PORTS=""
-          break ;;
-        *) warn "Введи 1, 2 или 3" ;;
-      esac
-    done
+  if ! flag_seen "no-firewall"; then
+    ask_yes "Настраивать фаервол и порты (UFW)?" y || NO_FIREWALL=true
   fi
-  parse_port_specs
-  audit_ports
+  if $NO_FIREWALL; then
+    log "Фаервол и порты: не трогаю — остаётся как есть"
+  else
+    port_survey_print
+
+    if ! flag_seen "ports"; then
+      local ext_tcp=0 ext_udp=0
+      count_external_ports ext_tcp ext_udp
+      local _choice
+      echo
+      log "Как поступить с портами для внешнего доступа?"
+      echo -e "  ${C}1${N} — открыть всё, что уже слушается извне (tcp: $ext_tcp, udp: $ext_udp)"
+      echo -e "  ${C}2${N} — задать список вручную (порт[/tcp|udp|both] или диапазон 30000-40000/udp, через запятую)"
+      echo -e "  ${C}3${N} — ничего не открывать"
+      local def="1"
+      if (( ext_tcp + ext_udp == 0 )); then def="2"; fi
+      while true; do
+        get_answer _choice "Выбор" "$def"
+        case "$_choice" in
+          1)
+            if (( ext_tcp + ext_udp > 0 )); then collect_external_ports; else OPEN_PORTS=""; fi
+            break ;;
+          2)
+            get_answer OPEN_PORTS "Порты (например 443/tcp,8443/udp,30000-40000/udp)" ""
+            OPEN_PORTS="${OPEN_PORTS// /}"
+            break ;;
+          3)
+            OPEN_PORTS=""
+            break ;;
+          *) warn "Введи 1, 2 или 3" ;;
+        esac
+      done
+    fi
+    parse_port_specs
+    audit_ports
+  fi
   echo
 
+  if ! flag_seen "no-update"; then
+    ask_yes "Обновлять систему (apt update/upgrade, может занять несколько минут)?" y || NO_UPDATE=true
+  fi
   if ! flag_seen "disable-ipv6"; then
     ask_yes "Отключить IPv6?" n && DISABLE_IPV6=true
   fi
@@ -1109,7 +1160,7 @@ wizard_questions() {
   if ! flag_seen "no-fail2ban"; then
     ask_yes "Поставить fail2ban (бан брутфорса SSH)?" y || SKIP_FAIL2BAN=true
   fi
-  if ! flag_seen "no-ssh-harden"; then
+  if ! flag_seen "no-ssh-harden" && ! $NO_SSH; then
     ask_yes "Харденинг SSH (без X11/агента, лимит попыток)?" y || HARDEN_SSH=false
   fi
   if ! flag_seen "no-docker"; then
@@ -1118,7 +1169,7 @@ wizard_questions() {
   if ! flag_seen "purge-cloudinit"; then
     ask_yes "Удалить cloud-init? (только если VPS без него обходится)" n && PURGE_CLOUDINIT=true
   fi
-  if ! flag_seen "disable-ssh-password"; then
+  if ! flag_seen "disable-ssh-password" && ! $NO_SSH; then
     local keys_ahead=false
     if [[ -n "$ADMIN_USER" && "$ADMIN_KEY_MODE" != "skip" ]]; then keys_ahead=true; fi
     if [[ -s /root/.ssh/authorized_keys ]]; then keys_ahead=true; fi
@@ -1141,6 +1192,7 @@ show_plan() {
   if [[ -z "$specs" ]]; then specs="никакие"; fi
   echo
   echo -e "${C}──────────────── План настройки ────────────────${N}"
+  echo "  Обновление:    $( $NO_UPDATE && echo 'пропустить' || echo 'apt update/upgrade' )"
   echo "  Таймзона:      ${TIMEZONE:-не менять}"
   echo "  Hostname:      ${HOSTNAME_NEW:-оставить «$(hostname)»}"
   echo "  Порт SSH:      ${SSH_PORT:-остаётся $CURR_SSH_PORT}"
@@ -1152,8 +1204,14 @@ show_plan() {
   else
     echo "  Пользователь:  работаем под root"
   fi
-  echo "  Порты наружу:  $specs"
-  if $DISABLE_SSH_PASSWORD; then
+  if $NO_FIREWALL; then
+    echo "  Фаервол:       не трогать (UFW и порты остаются как есть)"
+  else
+    echo "  Порты наружу:  $specs"
+  fi
+  if $NO_SSH; then
+    echo "  SSH:           не трогать (настройки sshd остаются как есть)"
+  elif $DISABLE_SSH_PASSWORD; then
     echo "  Пароли SSH:    отключить (только ключи)"
   else
     echo "  Пароли SSH:    оставить включёнными"
@@ -1198,7 +1256,7 @@ main() {
   install_admin_keys
   tune_network
   system_limits
-  if ! $WIZARD_RAN; then
+  if ! $WIZARD_RAN && ! $NO_FIREWALL; then
     port_survey_print
     audit_ports
   fi
