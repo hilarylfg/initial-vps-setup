@@ -109,6 +109,32 @@ is_valid_hostname() { [[ "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]
 
 is_valid_timezone() { timedatectl list-timezones 2>/dev/null | grep -qxF "$1"; }
 
+# «Снаружи» = wildcard или публичный IP. Локальные/приватные/служебные диапазоны — мимо,
+# фаервол на них всё равно не влияет.
+addr_is_external() {
+  local ip="$1"
+  case "$ip" in
+    '*'|0.0.0.0|'[::]'|'::') return 0 ;;
+    127.*|::1|'[::1]'|169.254.*|10.*|192.168.*) return 1 ;;
+    172.*)
+      local o2="${ip#*.}"
+      o2="${o2%%.*}"
+      if [[ "$o2" =~ ^[0-9]+$ ]] && (( o2 >= 16 && o2 <= 31 )); then return 1; fi
+      return 0 ;;
+    224.*|225.*|226.*|227.*|228.*|229.*|23[0-9].*|2[4-9][0-9].*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# «1 порт / 2 порта / 5 портов»
+ru_plural() {
+  local n="$1" one="$2" few="$3" many="$4"
+  local m10=$(( n % 10 )) m100=$(( n % 100 ))
+  if (( m10 == 1 && m100 != 11 )); then printf '%s' "$one"
+  elif (( m10 >= 2 && m10 <= 4 && ( m100 < 10 || m100 >= 20 ) )); then printf '%s' "$few"
+  else printf '%s' "$many"; fi
+}
+
 #----------------------- HELP -----------------------------------
 usage() {
   cat <<'EOF'
@@ -119,8 +145,9 @@ usage() {
   пропускаются (удобно для автоматического разворачивания).
 
   --ssh-port PORT           сменить порт SSH (например 2222)
-  --ports СПИСОК            открыть порты: порт[/tcp|udp|both] через запятую,
-                            например 443/tcp,8443/udp,8080 (по умолчанию tcp)
+  --ports СПИСОК            открыть порты: порт или диапазон с протоколом
+                            [/tcp|udp|both] через запятую, например
+                            443/tcp,8443/udp,30000-40000/udp (по умолчанию tcp)
   --timezone TZ             установить таймзону (Europe/Moscow)
   --admin USER              создать пользователя с sudo без пароля (NOPASSWD)
   --ssh-key "KEY"           публичный SSH-ключ для admin (или для root, если
@@ -173,11 +200,12 @@ parse() {
   done
 }
 
-# OPEN_PORTS → массивы PORTS_NUM / PORTS_PROTO (tcp | udp | both)
+# OPEN_PORTS → массивы PORTS_NUM / PORTS_PROTO (tcp | udp | both).
+# Порт можно задать диапазоном: 30000-40000/udp → в UFW уйдёт как 30000:40000/udp
 parse_port_specs() {
   PORTS_NUM=(); PORTS_PROTO=()
   [[ -z "$OPEN_PORTS" ]] && return 0
-  local items p pr
+  local items p pr lo hi
   IFS=',' read -ra items <<< "$OPEN_PORTS"
   for p in "${items[@]}"; do
     p="${p//[[:space:]]/}"
@@ -187,13 +215,38 @@ parse_port_specs() {
     else
       pr="tcp"
     fi
-    is_valid_port "$p" || die "Порт «$p» — не число из диапазона 1–65535"
     case "$pr" in
       tcp|udp|both) ;;
       *) die "Протокол «$pr» у порта $p не понят: tcp, udp или both" ;;
     esac
-    PORTS_NUM+=("$p"); PORTS_PROTO+=("$pr")
+    if [[ "$p" == *-* ]]; then
+      lo="${p%%-*}"; hi="${p#*-}"
+      is_valid_port "$lo" || die "Начало диапазона «$p» — не число 1–65535"
+      is_valid_port "$hi" || die "Конец диапазона «$p» — не число 1–65535"
+      (( lo <= hi )) || die "Диапазон «$p»: начало больше конца"
+      PORTS_NUM+=("${lo}:${hi}")
+    else
+      is_valid_port "$p" || die "Порт «$p» — не число из диапазона 1–65535"
+      PORTS_NUM+=("$p")
+    fi
+    PORTS_PROTO+=("$pr")
   done
+}
+
+# Покрыт ли порт/протокол текущим списком открытия (учитывает диапазоны)
+port_in_specs() {
+  local net="$1" port="$2" i p pr lo hi
+  for i in "${!PORTS_NUM[@]}"; do
+    pr="${PORTS_PROTO[$i]}"; p="${PORTS_NUM[$i]}"
+    [[ "$pr" == "$net" || "$pr" == "both" ]] || continue
+    if [[ "$p" == *:* ]]; then
+      lo="${p%%:*}"; hi="${p##*:}"
+      if (( port >= lo && port <= hi )); then return 0; fi
+    else
+      if (( port == p )); then return 0; fi
+    fi
+  done
+  return 1
 }
 
 #----------------------- ШАГИ -----------------------------------
@@ -490,61 +543,169 @@ port_survey_print() {
     warn "Слушающих портов не нашлось (или ss не сработал)"
     return 0
   fi
-  local -a rows=()
-  local i
+  local ssh_p="${SSH_PORT:-$CURR_SSH_PORT}"
+  local -A grp=()
+  local -a grp_keys=()
+  local -A seen=()
+  local -a loc=()
+  local i net port proc ip key
   for i in "${!LISTEN_PORT[@]}"; do
-    rows+=("${LISTEN_NET[$i]}|${LISTEN_PORT[$i]}|${LISTEN_ADDR[$i]}|${LISTEN_PROC[$i]}")
+    net="${LISTEN_NET[$i]}"; port="${LISTEN_PORT[$i]}"; proc="${LISTEN_PROC[$i]}"
+    ip="${LISTEN_ADDR[$i]%:*}"; ip="${ip#[}"; ip="${ip%]}"
+    key="$net:$port"
+    [[ -n "${seen[$key]:-}" ]] && continue   # один порт в v4+v6 — показываем один раз
+    seen[$key]=1
+    if addr_is_external "$ip"; then
+      key="$net|$proc"
+      if [[ -z "${grp[$key]:-}" ]]; then
+        grp_keys+=("$key"); grp[$key]="$port"
+      else
+        grp[$key]+=" $port"
+      fi
+    else
+      loc+=("$port/$net ($proc)")
+    fi
   done
-  echo "  Сейчас слушается:"
-  printf '%-6s %-6s %-24s %s\n' "ПРОТО" "ПОРТ" "АДРЕС" "ПРОЦЕСС"
-  printf '%s\n' "${rows[@]}" | sort -t'|' -k2,2n -u | while IFS='|' read -r net p ad pr; do
-    printf '%-6s %-6s %-24s %s\n' "$net" "$p" "$ad" "$pr"
+  echo "  Слушается снаружи:"
+  if (( ${#grp_keys[@]} == 0 )); then
+    echo "    (ничего)"
+  fi
+  local k nl mark cnt label
+  local -a ports=()
+  for k in "${grp_keys[@]}"; do
+    net="${k%%|*}"; proc="${k#*|}"
+    # shellcheck disable=SC2086  # список числовых портов — разворот в столбец для sort
+    nl="$(printf '%s\n' ${grp[$k]} | sort -n | tr '\n' ' ')"
+    read -r -a ports <<< "$nl"
+    local count=${#ports[@]}
+    if (( count == 1 )); then
+      label="${ports[0]}"
+    elif (( count <= 6 )); then
+      label="$(printf '%s, ' "${ports[@]}")"
+      label="${label%, }"
+    else
+      label="$(printf '%s, ' "${ports[0]}" "${ports[1]}" "${ports[2]}")… +ещё $(( count - 3 ))"
+    fi
+    cnt=""
+    if (( count > 1 )); then
+      cnt="$count $(ru_plural "$count" порт порта портов): "
+    fi
+    mark=""
+    if [[ "$net" == tcp && " ${grp[$k]} " == *" $ssh_p "* ]]; then
+      mark="   ← порт SSH (открою отдельно)"
+    fi
+    printf '    %-4s %-14s %s%s\n' "$net" "$proc" "$cnt$label" "$mark"
+  done
+  if (( ${#loc[@]} > 0 )); then
+    echo "  Локальные (127.0.0.0/8 и т.п. — фаервол их не касается): ${loc[*]}"
+  fi
+}
+
+# Сколько внешних (не локальных, не SSH) портов слушается: → tcp, udp
+count_external_ports() {
+  local __t="$1" __u="$2"
+  local i ip port net key ext_t=0 ext_u=0
+  local -A seen=()
+  local ssh_p="${SSH_PORT:-$CURR_SSH_PORT}"
+  for i in "${!LISTEN_PORT[@]}"; do
+    net="${LISTEN_NET[$i]}"; port="${LISTEN_PORT[$i]}"
+    ip="${LISTEN_ADDR[$i]%:*}"; ip="${ip#[}"; ip="${ip%]}"
+    addr_is_external "$ip" || continue
+    [[ "$net" == tcp && "$port" == "$ssh_p" ]] && continue
+    key="$net:$port"
+    [[ -n "${seen[$key]:-}" ]] && continue
+    seen[$key]=1
+    if [[ "$net" == tcp ]]; then ext_t=$((ext_t+1)); else ext_u=$((ext_u+1)); fi
+  done
+  printf -v "$__t" '%s' "$ext_t"
+  printf -v "$__u" '%s' "$ext_u"
+}
+
+# Заполняет OPEN_PORTS всеми внешними слушающими портами (с их протоколами)
+collect_external_ports() {
+  local i ip port net key
+  local -A seen=()
+  local ssh_p="${SSH_PORT:-$CURR_SSH_PORT}"
+  OPEN_PORTS=""
+  for i in "${!LISTEN_PORT[@]}"; do
+    net="${LISTEN_NET[$i]}"; port="${LISTEN_PORT[$i]}"
+    ip="${LISTEN_ADDR[$i]%:*}"; ip="${ip#[}"; ip="${ip%]}"
+    addr_is_external "$ip" || continue
+    [[ "$net" == tcp && "$port" == "$ssh_p" ]] && continue
+    key="$net:$port"
+    [[ -n "${seen[$key]:-}" ]] && continue
+    seen[$key]=1
+    OPEN_PORTS+="${OPEN_PORTS:+,}${port}/${net}"
   done
 }
 
-# Сопоставление «слушается» ↔ «открываем» (нужны LISTEN_* и PORTS_*)
+# Сопоставление «слушается» ↔ «открываем». Предупреждения — по процессам, не по портам.
 audit_ports() {
   local ssh_p="${SSH_PORT:-$CURR_SSH_PORT}"
-  local -a want=()
-  local i j p pr key found seen_bad=" " seen_new=" "
-  for i in "${!PORTS_NUM[@]}"; do
-    p="${PORTS_NUM[$i]}"; pr="${PORTS_PROTO[$i]}"
-    case "$pr" in
-      tcp)  want+=("tcp:$p") ;;
-      udp)  want+=("udp:$p") ;;
-      both) want+=("tcp:$p") ; want+=("udp:$p") ;;
-    esac
-  done
-
-  # 1. слушается, но в список открытых не попало → UFW его закроет
+  local -A miss=()
+  local -a miss_keys=()
+  local i ip port net proc key
   for i in "${!LISTEN_PORT[@]}"; do
-    key="${LISTEN_NET[$i]}:${LISTEN_PORT[$i]}"
-    p="${LISTEN_ADDR[$i]%:*}"; p="${p#[}"; p="${p%]}"
-    if [[ "$p" == "127.0.0.1" || "$p" == "::1" ]]; then continue; fi
-    if [[ "${LISTEN_PORT[$i]}" == "$ssh_p" && "${LISTEN_NET[$i]}" == "tcp" ]]; then continue; fi
-    if [[ "$seen_bad" == *" $key "* ]]; then continue; fi
-    found=false
-    for j in "${!want[@]}"; do
-      if [[ "${want[$j]}" == "$key" ]]; then found=true; break; fi
-    done
-    if ! $found; then
-      seen_bad+=" $key "
-      warn "Порт ${LISTEN_PORT[$i]}/${LISTEN_NET[$i]} слушает «${LISTEN_PROC[$i]}» — в списке открытых его нет, UFW закроет доступ извне"
+    net="${LISTEN_NET[$i]}"; port="${LISTEN_PORT[$i]}"; proc="${LISTEN_PROC[$i]}"
+    ip="${LISTEN_ADDR[$i]%:*}"; ip="${ip#[}"; ip="${ip%]}"
+    addr_is_external "$ip" || continue
+    [[ "$net" == tcp && "$port" == "$ssh_p" ]] && continue
+    port_in_specs "$net" "$port" && continue
+    key="$net|$proc"
+    if [[ -z "${miss[$key]:-}" ]]; then
+      miss_keys+=("$key"); miss[$key]="$port"
+    else
+      miss[$key]+=" $port"
+    fi
+  done
+  local k nl count what
+  local -a mports=()
+  for k in "${miss_keys[@]}"; do
+    net="${k%%|*}"; proc="${k#*|}"
+    # shellcheck disable=SC2086  # список числовых портов — разворот в столбец для sort
+    nl="$(printf '%s\n' ${miss[$k]} | sort -n | tr '\n' ' ')"
+    read -r -a mports <<< "$nl"
+    count=${#mports[@]}
+    if (( count <= 3 )); then
+      nl="$(printf '%s, ' "${mports[@]}")"
+      nl="${nl%, }"
+    else
+      nl="$(printf '%s, ' "${mports[0]}" "${mports[1]}" "${mports[2]}")… +ещё $(( count - 3 ))"
+    fi
+    what="$(ru_plural "$count" порт порта портов)"
+    if (( count == 1 )); then
+      warn "«$proc» ($net): порт $nl слушается, но его нет в списке — UFW закроет доступ извне"
+    else
+      warn "«$proc» ($net): $count $what слушаются, но их нет в списке — UFW закроет доступ извне: $nl"
     fi
   done
 
-  # 2. открываем, но никто ещё не слушает → нормально до деплоя
-  for j in "${!want[@]}"; do
-    key="${want[$j]}"
-    if [[ "$seen_new" == *" $key "* ]]; then continue; fi
-    found=false
-    for i in "${!LISTEN_PORT[@]}"; do
-      if [[ "${LISTEN_NET[$i]}:${LISTEN_PORT[$i]}" == "$key" ]]; then found=true; break; fi
+  # Наоборот: открыли, а никто не слушает — норма до деплоя
+  local j p pr pr2 lo hi found seen_info=" "
+  local -a protos=()
+  for j in "${!PORTS_NUM[@]}"; do
+    p="${PORTS_NUM[$j]}"; pr="${PORTS_PROTO[$j]}"
+    protos=("$pr")
+    [[ "$pr" == "both" ]] && protos=(tcp udp)
+    for pr2 in "${protos[@]}"; do
+      key="$pr2:$p"
+      [[ "$seen_info" == *" $key "* ]] && continue
+      found=false
+      for i in "${!LISTEN_PORT[@]}"; do
+        [[ "${LISTEN_NET[$i]}" == "$pr2" ]] || continue
+        if [[ "$p" == *:* ]]; then
+          lo="${p%%:*}"; hi="${p##*:}"
+          port="${LISTEN_PORT[$i]}"
+          if (( port >= lo && port <= hi )); then found=true; break; fi
+        else
+          if (( LISTEN_PORT[i] == p )); then found=true; break; fi
+        fi
+      done
+      if ! $found; then
+        seen_info+=" $key "
+        log "Порт $p/$pr2 открыт — пока никто не слушает (норма до деплоя)"
+      fi
     done
-    if ! $found; then
-      seen_new+=" $key "
-      log "Порт ${key#*:}/${key%%:*} открыт — пока никто не слушает (норма до деплоя)"
-    fi
   done
 }
 
@@ -904,10 +1065,33 @@ wizard_questions() {
 
   port_survey_print
 
-  if [[ -z "$OPEN_PORTS" ]]; then
-    local _ports
-    get_answer _ports "Открыть порты: порт[/tcp|udp|both] через запятую, например 443/tcp,8443/udp (пусто — не открывать)" ""
-    OPEN_PORTS="${_ports// /}"
+  if ! flag_seen "ports"; then
+    local ext_tcp=0 ext_udp=0
+    count_external_ports ext_tcp ext_udp
+    local _choice
+    echo
+    log "Как поступить с портами для внешнего доступа?"
+    echo -e "  ${C}1${N} — открыть всё, что уже слушается извне (tcp: $ext_tcp, udp: $ext_udp)"
+    echo -e "  ${C}2${N} — задать список вручную (порт[/tcp|udp|both] или диапазон 30000-40000/udp, через запятую)"
+    echo -e "  ${C}3${N} — ничего не открывать"
+    local def="1"
+    if (( ext_tcp + ext_udp == 0 )); then def="2"; fi
+    while true; do
+      get_answer _choice "Выбор" "$def"
+      case "$_choice" in
+        1)
+          if (( ext_tcp + ext_udp > 0 )); then collect_external_ports; else OPEN_PORTS=""; fi
+          break ;;
+        2)
+          get_answer OPEN_PORTS "Порты (например 443/tcp,8443/udp,30000-40000/udp)" ""
+          OPEN_PORTS="${OPEN_PORTS// /}"
+          break ;;
+        3)
+          OPEN_PORTS=""
+          break ;;
+        *) warn "Введи 1, 2 или 3" ;;
+      esac
+    done
   fi
   parse_port_specs
   audit_ports
@@ -949,10 +1133,12 @@ wizard_questions() {
 }
 
 show_plan() {
-  local i specs=""
+  local i specs="" total=${#PORTS_NUM[@]}
   for i in "${!PORTS_NUM[@]}"; do
-    specs+="${PORTS_NUM[$i]}/${PORTS_PROTO[$i]} "
+    if (( i < 10 )); then specs+="${PORTS_NUM[$i]}/${PORTS_PROTO[$i]}  "; fi
   done
+  if (( total > 10 )); then specs+="… (+ещё $(( total - 10 )))"; fi
+  if [[ -z "$specs" ]]; then specs="никакие"; fi
   echo
   echo -e "${C}──────────────── План настройки ────────────────${N}"
   echo "  Таймзона:      ${TIMEZONE:-не менять}"
@@ -966,7 +1152,7 @@ show_plan() {
   else
     echo "  Пользователь:  работаем под root"
   fi
-  echo "  Порты наружу:  ${specs:-никакие}"
+  echo "  Порты наружу:  $specs"
   if $DISABLE_SSH_PASSWORD; then
     echo "  Пароли SSH:    отключить (только ключи)"
   else
