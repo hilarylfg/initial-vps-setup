@@ -260,7 +260,14 @@ port_in_specs() {
 
 #----------------------- ШАГИ -----------------------------------
 precheck() {
-  [[ $EUID -eq 0 ]] || die "Запусти от root: sudo bash $0"
+  if [[ $EUID -ne 0 ]]; then
+    if [[ "$0" == /dev/fd/* ]]; then
+      # запуск вида bash <(curl ...): /dev/fd/63 под sudo не живёт, нужен файл
+      die "Скрипт должен работать от root. Скачай и запусти через sudo:
+  curl -fsSL <адрес_скрипта> -o /tmp/setup.sh && sudo bash /tmp/setup.sh"
+    fi
+    die "Запусти от root: sudo bash $0"
+  fi
   if [[ -f /etc/os-release ]]; then
     . /etc/os-release
     case "${ID:-}" in
@@ -337,6 +344,12 @@ create_admin() {
     chmod 440 "$sf"
     visudo -cf "$sf" >/dev/null || { rm -f "$sf"; die "sudoers не прошёл проверку — файл удалён"; }
     log "sudo: команды от root без пароля (NOPASSWD)"
+  fi
+  # Проверяем на деле: sudo у пользователя работает без пароля?
+  if runuser -u "$ADMIN_USER" -- sudo -n true 2>/dev/null; then
+    log "Проверено: $ADMIN_USER выполняет sudo без пароля (root-шелл: sudo -i)"
+  else
+    warn "sudo без пароля у $ADMIN_USER НЕ работает — проверь /etc/sudoers.d/ и вручную: su - ; cat /etc/sudoers.d/90-${ADMIN_USER}"
   fi
   if [[ "$ADMIN_KEY_MODE" == "skip" || -z "$ADMIN_KEY_MODE" ]]; then
     warn "У $ADMIN_USER нет ключа и нет пароля (аккаунт заблокирован для входа) —"
