@@ -4,11 +4,13 @@
 #
 #  Поддержка: Ubuntu 20.04+ / Debian 11+, запуск от root.
 #  Без аргументов — интерактивный мастер: спросит всё и покажет план.
-#  С флагами — автоматический режим (заданное флагами не спрашивается).
-#  Повторный запуск безопасен — конфиги перезаписываются идемпотентно.
+#  Флаги задают ответы заранее; --doctor — только проверка, без изменений.
+#  Каждое действие проверяется по факту; итог — таблица [OK]/[WARN]/[FAIL].
+#  Полный лог: /var/log/vps-setup-<дата>.log (права 600).
 #================================================================
 
 set -euo pipefail
+set -E   # errtrace: ERR-trap срабатывает и внутри функций
 
 #----------------------- ОТВЕТЫ (флаги/визард) ------------------
 SSH_PORT=""            # пусто = не менять
@@ -27,22 +29,28 @@ SETUP_SWAP=true
 SKIP_FAIL2BAN=false
 PURGE_CLOUDINIT=false
 DISABLE_SSH_PASSWORD=false
-NO_UPDATE=false     # пропустить apt update/upgrade
+NO_UPDATE=false     # пропустить apt upgrade (update всё равно выполняется)
 NO_FIREWALL=false   # не трогать UFW и порты вообще
 NO_SSH=false        # не менять настройки sshd вообще
+DOCTOR=false        # только проверка, без изменений
 
 #----------------------- СОСТОЯНИЕ ------------------------------
 FLAGS_SEEN=" "
 INTERACTIVE=false
-WIZARD_RAN=false
 LEGACY_CLEANED=false
 CURR_SSH_PORT="22"
+CURR_SSH_SOURCE="default"   # ss | socket | sshd-t | default
+LOG_FILE=""
+FAIL_COUNT=0
 PORTS_NUM=()
 PORTS_PROTO=()
 LISTEN_NET=()
 LISTEN_PORT=()
 LISTEN_ADDR=()
 LISTEN_PROC=()
+STATE_DIR="/var/lib/vps-setup"
+SSH_HARDENING_CFG="/etc/ssh/sshd_config.d/00-hardening.conf"
+SSH_LEGACY_CFG="/etc/ssh/sshd_config.d/99-hardening.conf"
 
 #----------------------- ЛОГИ -----------------------------------
 G='\033[0;32m'; Y='\033[1;33m'; R='\033[0;31m'; C='\033[0;36m'; N='\033[0m'
@@ -51,7 +59,70 @@ log()  { echo -e "${G}[+]${N} $*"; }
 warn() { echo -e "${Y}[!]${N} $*"; }
 die()  { echo -e "${R}[x]${N} $*" >&2; exit 1; }
 step() { CURRENT_STEP="$*"; echo -e "\n${C}━━━ $* ━━━${N}"; }
-trap 'echo -e "\n${R}Ошибка на шаге: ${CURRENT_STEP}. Текущая SSH-сессия не закрыта — сервер доступен.${N}"' ERR
+trap 'echo -e "\n${R}Неожиданная ошибка на шаге «${CURRENT_STEP}» (строка $LINENO). Текущая SSH-сессия не закрыта — сервер доступен. Лог: ${LOG_FILE:-нет}${N}"' ERR
+
+#----------------------- ОТЧЁТ (выполнил → проверил → отчитался) --
+declare -A CHECK_STATUS=()
+declare -A CHECK_HINT=()
+CHECK_ORDER=()
+FAILED_STEPS=()
+
+report() { # report "Имя" ok|warn|fail "пояснение"
+  local name="$1" st="$2" hint="${3:-}"
+  if [[ -z "${CHECK_STATUS[$name]:-}" ]]; then
+    CHECK_ORDER+=("$name")
+  fi
+  CHECK_STATUS[$name]="$st"
+  CHECK_HINT[$name]="$hint"
+  case "$st" in
+    ok)   log "$name: OK${hint:+ — $hint}" ;;
+    warn) warn "$name: ВНИМАНИЕ${hint:+ — $hint}" ;;
+    *)    echo -e "${R}[✗]${N} $name: НЕ УДАЛОСЬ${hint:+ — $hint}" >&2 ;;
+  esac
+}
+
+run_step() { # run_step "Имя шага" функция — падение шага не убивает остальные
+  local name="$1"; shift
+  step "$name"
+  local rc=0
+  "$@" || rc=$?
+  if (( rc != 0 )); then
+    FAILED_STEPS+=("$name")
+    warn "Шаг «$name» завершился с ошибкой (код $rc) — продолжаю остальные, смотри отчёт в конце"
+  fi
+}
+
+print_report() {
+  echo
+  echo -e "${C}──────────── Результат (проверено по факту) ────────────${N}"
+  local name st ok=0 wn=0 fl=0
+  for name in "${CHECK_ORDER[@]}"; do
+    st="${CHECK_STATUS[$name]}"
+    case "$st" in
+      ok)   printf '  %b[ OK ]%b %-22s %s\n' "$G" "$N" "$name" "${CHECK_HINT[$name]}"; ok=$((ok+1)) ;;
+      warn) printf '  %b[WARN]%b %-22s %s\n' "$Y" "$N" "$name" "${CHECK_HINT[$name]}"; wn=$((wn+1)) ;;
+      *)    printf '  %b[FAIL]%b %-22s %s\n' "$R" "$N" "$name" "${CHECK_HINT[$name]}"; fl=$((fl+1)) ;;
+    esac
+  done
+  echo -e "${C}─────────────────────────────────────────────────────────${N}"
+  printf '  Итог: %d OK, %d предупреждений, %d неудач\n' "$ok" "$wn" "$fl"
+  FAIL_COUNT=$fl
+  if (( fl > 0 )); then
+    warn "Не всё применилось — сервер работает, но проверь позиции FAIL. Лог: ${LOG_FILE:-нет}"
+  fi
+}
+
+setup_log() {
+  LOG_FILE="/var/log/vps-setup-$(date +%Y%m%d-%H%M%S).log"
+  if touch "$LOG_FILE" 2>/dev/null; then
+    chmod 600 "$LOG_FILE"
+    exec > >(tee -a "$LOG_FILE") 2>&1
+    log "Лог установки: $LOG_FILE"
+  else
+    LOG_FILE=""
+    warn "Не удалось создать лог-файл в /var/log — работаю без лога"
+  fi
+}
 
 #----------------------- ВВОД -----------------------------------
 have_tty() { [[ -t 0 ]] || { [[ -e /dev/tty && -r /dev/tty && -w /dev/tty ]]; }; }
@@ -80,20 +151,29 @@ get_answer() {
   printf -v "$__var" '%s' "$REPLY"
 }
 
-# ask_yes "вопрос" y|n → 0 = да
+# ask_yes "вопрос" y|n → 0 = да. Сравнение целых строк — работает в любой локали
+# (в C-локали срез ${var:0:1} отрезает байт, а не символ, и кириллица ломается)
 ask_yes() {
   local __def="${2:-n}"
   if ! read_answer "$1 [${__def}]: " || [[ -z "$REPLY" ]]; then
     REPLY="$__def"
   fi
-  [[ "$REPLY" =~ ^[YyДд]$ ]]
+  case "$REPLY" in
+    y|Y|yes|Yes|YES|д|Д|да|Да|ДА) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # Вопрос задаётся только если соответствующий флаг не задан
 flag_seen() { [[ "$FLAGS_SEEN" == *" $1 "* ]]; }
 
 #----------------------- ВАЛИДАЦИЯ ------------------------------
-is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
+# 10# — принудительно десятичная база: «022» это 22, а не октал
+is_valid_port() {
+  [[ "$1" =~ ^[0-9]{1,5}$ ]] || return 1
+  local p=$((10#$1))
+  (( p >= 1 && p <= 65535 ))
+}
 
 is_valid_pubkey() {
   if command -v ssh-keygen >/dev/null 2>&1; then
@@ -110,21 +190,24 @@ is_reserved_username() { [[ " $RESERVED_USERS " == *" $1 "* ]]; }
 
 is_valid_hostname() { [[ "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]]; }
 
-is_valid_timezone() { timedatectl list-timezones 2>/dev/null | grep -qxF "$1"; }
+is_valid_timezone() { grep -qxF "$1" <<< "$(timedatectl list-timezones 2>/dev/null)"; }
 
-# «Снаружи» = wildcard или публичный IP. Локальные/приватные/служебные диапазоны — мимо,
-# фаервол на них всё равно не влияет.
+# «Снаружи» = wildcard или публичный IP. Локальные/приватные/служебные — мимо.
 addr_is_external() {
   local ip="$1"
   case "$ip" in
     '*'|0.0.0.0|'[::]'|'::') return 0 ;;
     127.*|::1|'[::1]'|169.254.*|10.*|192.168.*) return 1 ;;
+    # CGNAT 100.64.0.0/10
+    100.6[4-9].*|100.[7-9][0-9].*|100.1[0-1][0-9].*|100.12[0-7].*) return 1 ;;
     172.*)
       local o2="${ip#*.}"
       o2="${o2%%.*}"
       if [[ "$o2" =~ ^[0-9]+$ ]] && (( o2 >= 16 && o2 <= 31 )); then return 1; fi
       return 0 ;;
     224.*|225.*|226.*|227.*|228.*|229.*|23[0-9].*|2[4-9][0-9].*) return 1 ;;
+    # IPv6: ULA fc00::/7, link-local fe80::/10, multicast ff00::/8
+    f[cd]*|F[CD]*|fe[89ab]*|FE[89AB]*|ff*|FF*) return 1 ;;
     *) return 0 ;;
   esac
 }
@@ -147,6 +230,8 @@ usage() {
   перед изменениями. Флаги задают ответы заранее — такие вопросы
   пропускаются (удобно для автоматического разворачивания).
 
+  --doctor                  только проверить сервер и показать отчёт,
+                            ничего не меняя
   --ssh-port PORT           сменить порт SSH (например 2222)
   --ports СПИСОК            открыть порты: порт или диапазон с протоколом
                             [/tcp|udp|both] через запятую, например
@@ -159,12 +244,12 @@ usage() {
   --generate-key            сгенерировать ed25519-пару на сервере
                             (приватный ключ будет показан один раз)
   --hostname NAME           задать hostname
-  --disable-ipv6            отключить IPv6 (по умолчанию остаётся включённым)
-  --no-update               не обновлять систему (apt update/upgrade)
+  --disable-ipv6            отключить IPv6
+  --no-update               не обновлять пакеты (apt update всё равно пройдёт)
   --no-firewall             не трогать фаервол и порты: UFW остаётся как есть
   --no-ssh                  не менять настройки sshd: порт, харденинг, пароли
   --no-docker               не ставить Docker
-  --no-fail2ban             пропустить fail2ban
+  --no-fail2ban             не ставить и не настраивать fail2ban
   --no-block-ping           НЕ блокировать ответы на ping
   --no-swap                 не создавать swap
   --no-ssh-harden           не применять харденинг SSH
@@ -174,6 +259,7 @@ usage() {
 
 Примеры:
   bash setup.sh                                          # мастер
+  bash setup.sh --doctor                                 # только проверка
   bash setup.sh --admin deploy --ssh-key "$(cat ~/.ssh/id_ed25519.pub)" \
        --ssh-port 2222 --ports 443/tcp,8443/udp --timezone Europe/Amsterdam
 EOF
@@ -184,6 +270,7 @@ need() { [[ -n "${2:-}" ]] || die "$1: укажи значение"; }
 parse() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --doctor)               DOCTOR=true; FLAGS_SEEN+="doctor "; shift ;;
       --ssh-port)             need "$1" "${2:-}"; SSH_PORT="$2"; FLAGS_SEEN+="ssh-port "; shift 2 ;;
       --ports)                need "$1" "${2:-}"; OPEN_PORTS="$2"; FLAGS_SEEN+="ports "; shift 2 ;;
       --timezone)             need "$1" "${2:-}"; TIMEZONE="$2"; FLAGS_SEEN+="timezone "; shift 2 ;;
@@ -232,11 +319,12 @@ parse_port_specs() {
       lo="${p%%-*}"; hi="${p#*-}"
       is_valid_port "$lo" || die "Начало диапазона «$p» — не число 1–65535"
       is_valid_port "$hi" || die "Конец диапазона «$p» — не число 1–65535"
+      lo=$((10#$lo)); hi=$((10#$hi))
       (( lo <= hi )) || die "Диапазон «$p»: начало больше конца"
       PORTS_NUM+=("${lo}:${hi}")
     else
       is_valid_port "$p" || die "Порт «$p» — не число из диапазона 1–65535"
-      PORTS_NUM+=("$p")
+      PORTS_NUM+=("$((10#$p))")
     fi
     PORTS_PROTO+=("$pr")
   done
@@ -258,11 +346,44 @@ port_in_specs() {
   return 1
 }
 
+#----------------------- СИСТЕМНЫЕ УТИЛИТЫ ----------------------
+aptget() {
+  apt-get -y -o DPkg::Lock::Timeout=600 "$@"
+}
+
+# Фактический порт sshd: из реального прослушивания → из сокета → из конфига → 22
+# Вывод сначала читается целиком в переменную: «writer | grep -q» под pipefail
+# ловит SIGPIPE от раннего выхода grep и даёт ложный негатив на загруженных серверах.
+detect_ssh_port() {
+  local all port=""
+  if command -v ss >/dev/null 2>&1; then
+    all="$(ss -H -tlnp 2>/dev/null | awk '/users:\(\("sshd"/ {n=split($4,a,":"); print a[n]}' || true)"
+    port="${all%%$'\n'*}"
+    [[ -n "$port" ]] && { echo "$port"; return; }
+  fi
+  if systemctl is-active ssh.socket >/dev/null 2>&1; then
+    all="$(systemctl show ssh.socket -p ListenStream --value 2>/dev/null || true)"
+    port="${all%%$'\n'*}"
+    [[ -n "$port" ]] && { echo "$port"; return; }
+  fi
+  port="$(timeout 5 sshd -T 2>/dev/null | awk 'tolower($1)=="port"{print $2}' || true)"
+  port="${port%%$'\n'*}"
+  [[ -n "$port" ]] && { echo "$port"; return; }
+  echo 22
+}
+
+port_is_listening() { # $1 = порт
+  local ports
+  ports="$(ss -H -tln 2>/dev/null | awk '{n=split($4,a,":"); print a[n]}' || true)"
+  printf '%s\n' "$ports" | grep -qx "$1"
+}
+
+virt_kind() { systemd-detect-virt 2>/dev/null || echo "unknown"; }
+
 #----------------------- ШАГИ -----------------------------------
 precheck() {
   if [[ $EUID -ne 0 ]]; then
     if [[ "$0" == /dev/fd/* ]]; then
-      # запуск вида bash <(curl ...): /dev/fd/63 под sudo не живёт, нужен файл
       die "Скрипт должен работать от root. Скачай и запусти через sudo:
   curl -fsSL <адрес_скрипта> -o /tmp/setup.sh && sudo bash /tmp/setup.sh"
     fi
@@ -275,43 +396,62 @@ precheck() {
       *) warn "ОС '${ID:-?}' не тестировалась (ориентируюсь на Ubuntu/Debian). Продолжаю..." ;;
     esac
   fi
-  # Определяем текущий порт sshd. Никак не должен остановить скрипт:
-  # ни зависнуть, ни упасть (странные конфиги/образы встречаются).
-  CURR_SSH_PORT="$(timeout 5 sshd -T 2>/dev/null | awk 'tolower($1)=="port"{print $2; exit}' || true)"
-  CURR_SSH_PORT="${CURR_SSH_PORT:-22}"
+  CURR_SSH_PORT="$(detect_ssh_port)"
+  if [[ "$CURR_SSH_PORT" == "22" ]]; then
+    if command -v ss >/dev/null 2>&1 && ss -H -tlnp 2>/dev/null | grep -q 'users:(("sshd"'; then
+      CURR_SSH_SOURCE="ss"
+    elif systemctl is-active ssh.socket >/dev/null 2>&1; then
+      CURR_SSH_SOURCE="socket"
+    elif timeout 5 sshd -T >/dev/null 2>&1; then
+      CURR_SSH_SOURCE="sshd-t"
+    fi
+  else
+    if ss -H -tlnp 2>/dev/null | grep -q 'users:(("sshd"'; then CURR_SSH_SOURCE="ss"
+    elif systemctl is-active ssh.socket >/dev/null 2>&1; then CURR_SSH_SOURCE="socket"
+    else CURR_SSH_SOURCE="sshd-t"; fi
+  fi
+  log "Текущий порт SSH: $CURR_SSH_PORT (определён по: $CURR_SSH_SOURCE)"
+  log "Виртуализация: $(virt_kind)"
 }
 
 update_system() {
+  aptget update
   if $NO_UPDATE; then
-    log "Обновление системы: пропущено"
+    report "Обновление" ok "apt update выполнен, upgrade пропущен (--no-update)"
     return 0
   fi
-  step "Обновление системы"
-  apt-get update -y
-  apt-get -y -o Dpkg::Options::="--force-confold" upgrade
-  apt-get -y -o Dpkg::Options::="--force-confold" full-upgrade
-  apt-get autoremove -y
-  apt-get autoclean -y
-  log "Система обновлена"
+  aptget -o Dpkg::Options::="--force-confold" upgrade
+  aptget -o Dpkg::Options::="--force-confold" full-upgrade
+  aptget autoremove
+  aptget autoclean
+  report "Обновление" ok "apt update + full-upgrade"
 }
 
 install_base() {
-  step "Базовые пакеты"
   local pkgs="curl wget git jq unzip ca-certificates socat cron procps sudo"
-  pkgs+=" htop vnstat mtr-tiny iperf3 netcat-openbsd speedtest-cli fail2ban"
+  pkgs+=" htop vnstat mtr-tiny iperf3 netcat-openbsd speedtest-cli"
   if ! $NO_FIREWALL; then pkgs+=" ufw"; fi
+  if ! $SKIP_FAIL2BAN; then pkgs+=" fail2ban"; fi
   # shellcheck disable=SC2086  # список пакетов — намеренное разделение на слова
-  apt-get install -y $pkgs
+  aptget -o Dpkg::Options::="--force-confold" install $pkgs
   systemctl enable --now vnstat >/dev/null 2>&1 || true
-  log "Базовые пакеты установлены"
+  local missing="" p
+  # shellcheck disable=SC2086
+  for p in $pkgs; do
+    dpkg -s "$p" >/dev/null 2>&1 || missing+=" $p"
+  done
+  if [[ -z "$missing" ]]; then
+    report "Базовые пакеты" ok "все на месте"
+  else
+    report "Базовые пакеты" fail "не установились:$missing"
+    return 1
+  fi
 }
 
 set_time_and_host() {
-  step "Время и hostname"
   timedatectl set-ntp true
   if [[ -n "$TIMEZONE" ]]; then
     timedatectl set-timezone "$TIMEZONE"
-    log "Таймзона: $TIMEZONE"
   fi
   if [[ -n "$HOSTNAME_NEW" ]]; then
     hostnamectl set-hostname "$HOSTNAME_NEW"
@@ -320,16 +460,40 @@ set_time_and_host() {
     else
       echo "127.0.1.1 ${HOSTNAME_NEW}" >> /etc/hosts
     fi
-    log "Hostname: $HOSTNAME_NEW"
   fi
-  log "Время: $(date '+%F %T %Z')"
+  # проверка по факту
+  local tz_now ntp_ok hn_now ok=true
+  tz_now="$(timedatectl show -p Timezone --value 2>/dev/null || echo '?')"
+  if [[ -n "$TIMEZONE" ]]; then
+    if [[ "$tz_now" == "$TIMEZONE" ]]; then
+      report "Таймзона" ok "$tz_now"
+    else
+      report "Таймзона" fail "ждали $TIMEZONE, фактически $tz_now"; ok=false
+    fi
+  else
+    report "Таймзона" ok "$tz_now (не меняли)"
+  fi
+  ntp_ok="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo no)"
+  if [[ "$ntp_ok" == "yes" ]]; then
+    report "Время (NTP)" ok "синхронизировано"
+  else
+    report "Время (NTP)" warn "ещё не синхронизировалось — проверь позже: timedatectl"
+  fi
+  if [[ -n "$HOSTNAME_NEW" ]]; then
+    hn_now="$(hostname)"
+    if [[ "$hn_now" == "$HOSTNAME_NEW" ]]; then
+      report "Hostname" ok "$hn_now"
+    else
+      report "Hostname" fail "ждали $HOSTNAME_NEW, фактически $hn_now"; ok=false
+    fi
+  fi
+  $ok || return 1
 }
 
 create_admin() {
   [[ -n "$ADMIN_USER" ]] || return 0
-  step "Пользователь ${ADMIN_USER}"
   if id "$ADMIN_USER" &>/dev/null; then
-    log "Уже существует — использую"
+    log "Пользователь $ADMIN_USER уже существует — использую"
   else
     useradd -m -s /bin/bash "$ADMIN_USER"
     log "Создан"
@@ -343,21 +507,26 @@ create_admin() {
     echo "${ADMIN_USER} ALL=(ALL) NOPASSWD:ALL" > "$sf"
     chmod 440 "$sf"
     visudo -cf "$sf" >/dev/null || { rm -f "$sf"; die "sudoers не прошёл проверку — файл удалён"; }
-    log "sudo: команды от root без пароля (NOPASSWD)"
   fi
-  # Проверяем на деле: sudo у пользователя работает без пароля?
-  if runuser -u "$ADMIN_USER" -- sudo -n true 2>/dev/null; then
-    log "Проверено: $ADMIN_USER выполняет sudo без пароля (root-шелл: sudo -i)"
+  # проверяем на деле: sudo без пароля и группа на месте
+  local sudo_ok=false grp_ok=false
+  if runuser -u "$ADMIN_USER" -- sudo -n true 2>/dev/null; then sudo_ok=true; fi
+  if id -nG "$ADMIN_USER" | grep -qw sudo; then grp_ok=true; fi
+  if $sudo_ok && $grp_ok; then
+    report "Пользователь $ADMIN_USER" ok "sudo без пароля работает (root-шелл: sudo -i)"
   else
-    warn "sudo без пароля у $ADMIN_USER НЕ работает — проверь /etc/sudoers.d/ и вручную: su - ; cat /etc/sudoers.d/90-${ADMIN_USER}"
+    local why=""
+    $grp_ok  || why+="нет в группе sudo; "
+    $sudo_ok || why+="sudo без пароля не работает"
+    report "Пользователь $ADMIN_USER" fail "$why — проверь /etc/sudoers.d/90-${ADMIN_USER}"
+    return 1
   fi
-  if [[ "$ADMIN_KEY_MODE" == "skip" || -z "$ADMIN_KEY_MODE" ]]; then
-    warn "У $ADMIN_USER нет ключа и нет пароля (аккаунт заблокирован для входа) —"
-    warn "добавь ключ в /home/${ADMIN_USER}/.ssh/authorized_keys, иначе в аккаунт не войти"
+  if [[ "$ADMIN_KEY_MODE" == "skip" || -z "$ADMIN_KEY_MODE" ]] && [[ ! -s "/home/${ADMIN_USER}/.ssh/authorized_keys" ]]; then
+    warn "У $ADMIN_USER нет ключа и нет пароля (вход заблокирован) — добавь ключ в /home/${ADMIN_USER}/.ssh/authorized_keys"
   fi
 }
 
-install_key_line() { # $1 = authorized_keys, $2 = строка ключа
+install_key_line() { # $1 = authorized_keys, $2 = строка ключа; вывод: число добавленных
   local ak="$1" key="$2"
   if command -v ssh-keygen >/dev/null 2>&1 && ! printf '%s\n' "$key" | ssh-keygen -lf - >/dev/null 2>&1; then
     warn "Ключ невалиден, пропускаю: $(awk '{print $1}' <<< "$key") ..."
@@ -365,59 +534,71 @@ install_key_line() { # $1 = authorized_keys, $2 = строка ключа
   fi
   touch "$ak"
   chmod 600 "$ak"
-  grep -qxF "$key" "$ak" || echo "$key" >> "$ak"
+  grep -qxF "$key" "$ak" && return 0
+  echo "$key" >> "$ak"
+  return 0
 }
+
+count_keys_in() { grep -cE '^(ssh-|ecdsa-|sk-)' "$1" 2>/dev/null || true; }
 
 install_admin_keys() {
   [[ -n "$ADMIN_USER" ]] || return 0
-  step "SSH-ключи для ${ADMIN_USER}"
   local home="/home/${ADMIN_USER}"
   local ak="${home}/.ssh/authorized_keys"
   mkdir -p "${home}/.ssh"
+
+  # 1) Вставленные ключи (--ssh-key / визард) ставим в любом режиме
+  local k added=0
+  for k in "${ADMIN_SSH_KEYS[@]}"; do
+    if install_key_line "$ak" "$k"; then
+      log "Ключ добавлен: $(awk '{print $1}' <<< "$k")"
+      added=$((added+1))
+    fi
+  done
+
+  # 2) Основной режим
   case "$ADMIN_KEY_MODE" in
     root)
       if [[ -s /root/.ssh/authorized_keys ]]; then
-        local k added=0
         while IFS= read -r k; do
           [[ -z "$k" ]] && continue
           if install_key_line "$ak" "$k"; then added=$((added+1)); fi
         done < /root/.ssh/authorized_keys
-        log "Скопировано ключей из root: $added"
+        log "Ключи скопированы из root"
       else
-        warn "У root ключей нет — пропускаю"
+        warn "У root ключей нет — копировать нечего"
       fi
       ;;
     generate)
       local kp="/root/${ADMIN_USER}-ed25519"
       if [[ -f "$kp" ]]; then
-        log "Пара уже существует: $kp — использую"
+        log "Пара уже существует: $kp — приватный ключ повторно не показываю"
+        install_key_line "$ak" "$(cat "${kp}.pub")" || true
       else
         ssh-keygen -t ed25519 -f "$kp" -N '' -C "${ADMIN_USER}@${HOSTNAME_NEW:-$(hostname)}" >/dev/null
+        GENERATED_KEY_PATH="$kp"
+        install_key_line "$ak" "$(cat "${kp}.pub")" || true
+        chmod 600 "$kp"
+        echo
+        warn "────────────── СКАЧАЙ ПРИВАТНЫЙ КЛЮЧ ПРЯМО СЕЙЧАС ──────────────"
+        cat "$kp"
+        warn "Сохрани его локально (~/.ssh/), затем удали с сервера: shred -u $kp"
+        warn "(он также записан в лог $LOG_FILE — файл закрыт правами 600)"
+        warn "─────────────────────────────────────────────────────────────────"
       fi
-      GENERATED_KEY_PATH="$kp"
-      install_key_line "$ak" "$(cat "${kp}.pub")"
-      chmod 600 "$kp"
-      echo
-      warn "────────────── СКАЧАЙ ПРИВАТНЫЙ КЛЮЧ ПРЯМО СЕЙЧАС ──────────────"
-      cat "$kp"
-      warn "Сохрани его локально (~/ .ssh/), затем удали с сервера:"
-      warn "  shred -u $kp"
-      warn "─────────────────────────────────────────────────────────────────"
-      ;;
-    paste)
-      local k
-      for k in "${ADMIN_SSH_KEYS[@]}"; do
-        if install_key_line "$ak" "$k"; then
-          log "Ключ добавлен: $(awk '{print $1}' <<< "$k")"
-        fi
-      done
-      ;;
-    *)
-      log "Ключи не устанавливаю"
       ;;
   esac
+
   chmod 700 "${home}/.ssh"
   chown -R "${ADMIN_USER}:${ADMIN_USER}" "${home}/.ssh"
+
+  local n
+  n="$(count_keys_in "$ak")"
+  if (( n > 0 )); then
+    report "SSH-ключи $ADMIN_USER" ok "ключей в authorized_keys: $n"
+  else
+    report "SSH-ключи $ADMIN_USER" warn "ключей нет — вход по паролю останется"
+  fi
 }
 
 # Ключи, переданные через --ssh-key без --admin, кладём root-у
@@ -425,17 +606,23 @@ install_root_keys() {
   [[ -z "$ADMIN_USER" && "${#ADMIN_SSH_KEYS[@]}" -gt 0 ]] || return 0
   mkdir -p /root/.ssh
   chmod 700 /root/.ssh
-  local k
+  local k added=0
   for k in "${ADMIN_SSH_KEYS[@]}"; do
     if install_key_line /root/.ssh/authorized_keys "$k"; then
       log "Ключ добавлен root: $(awk '{print $1}' <<< "$k")"
+      added=$((added+1))
     fi
   done
+  local n
+  n="$(count_keys_in /root/.ssh/authorized_keys)"
+  if (( n > 0 )); then
+    report "SSH-ключи root" ok "ключей: $n"
+  else
+    report "SSH-ключи root" warn "ключей нет"
+  fi
 }
 
 tune_network() {
-  step "Сеть: BBR, IPv6, ping"
-
   modprobe tcp_bbr 2>/dev/null || true
   echo "tcp_bbr" > /etc/modules-load.d/tcp_bbr.conf 2>/dev/null || true
 
@@ -471,66 +658,125 @@ EOF
       LEGACY_CLEANED=true
     fi
   done
-  if $LEGACY_CLEANED; then
-    warn "Из /etc/sysctl.conf удалён тюнинг от старой версии скрипта."
-    warn "Перезагрузи сервер (reboot) после работы скрипта, чтобы сбросились старые значения ядра."
-  fi
 
   rm -f /etc/sysctl.d/99-disable-ipv6.conf
+  rm -f /etc/sysctl.d/99-block-ping.conf
   if $DISABLE_IPV6; then
     cat > /etc/sysctl.d/99-disable-ipv6.conf <<'EOF'
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 1
 EOF
-    log "IPv6: отключаю"
-  else
-    sysctl -w net.ipv6.conf.all.disable_ipv6=0     >/dev/null 2>&1 || true
-    sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1 || true
-    sysctl -w net.ipv6.conf.lo.disable_ipv6=0      >/dev/null 2>&1 || true
-    log "IPv6: оставляю включённым (по умолчанию)"
   fi
-
-  rm -f /etc/sysctl.d/99-block-ping.conf
   if $BLOCK_PING; then
-    cat > /etc/sysctl.d/99-block-ping.conf <<'EOF'
-net.ipv4.icmp_echo_ignore_all = 1
-EOF
+    echo "net.ipv4.icmp_echo_ignore_all = 1" > /etc/sysctl.d/99-block-ping.conf
   fi
 
   sysctl --system >/dev/null 2>&1 || true
 
-  if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]]; then
-    log "BBR включён"
+  # --- BBR + fq: проверяем оба параметра ---
+  local cc q
+  cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '?')"
+  q="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo '?')"
+  if [[ "$cc" == "bbr" && "$q" == "fq" ]]; then
+    report "BBR + fq" ok
+  elif [[ "$cc" == "bbr" ]]; then
+    report "BBR + fq" warn "bbr включён, но qdisc=$q (ожидали fq) — проверь ядро"
   else
-    warn "BBR не применился — проверь версию ядра (нужна 4.9+)"
+    report "BBR + fq" fail "congestion=$cc — ядро без BBR (нужно 4.9+)"
   fi
 
-  local ipv6_off
-  ipv6_off="$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 0)"
+  # --- IPv6 ---
+  rm -f /etc/sysctl.d/99-disable-ipv6.conf.tmp
   if $DISABLE_IPV6; then
-    if [[ "$ipv6_off" == "1" ]]; then
-      log "IPv6 отключён"
+    local v6off
+    v6off="$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 0)"
+    if [[ "$v6off" == "1" ]]; then
+      report "IPv6" ok "отключён"
     else
-      warn "IPv6 не отключился (частая история на LXC) — проверь после перезагрузки или в панели хостера"
+      local v
+      v="$(virt_kind)"
+      report "IPv6" fail "sysctl не применился (виртуализация: $v) — на контейнерах отключается только в панели хостера"
     fi
   else
-    if [[ "$ipv6_off" == "0" ]]; then
-      log "IPv6 включён"
+    # сбросить живое значение, если прошлый запуск отключал
+    sysctl -w net.ipv6.conf.all.disable_ipv6=0     >/dev/null 2>&1 || true
+    sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1 || true
+    sysctl -w net.ipv6.conf.lo.disable_ipv6=0      >/dev/null 2>&1 || true
+    local v6off2
+    v6off2="$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)"
+    if [[ "$v6off2" == "0" ]]; then
+      report "IPv6" ok "включён (как и выбрано)"
     else
-      warn "IPv6 сейчас отключён (остаток прошлых запусков/настройки хостера). Дроп-ин удалён — после перезагрузки IPv6 вернётся"
+      report "IPv6" warn "сейчас отключён (настройка хостера/прошлых запусков) — включится после перезагрузки"
     fi
   fi
 
-  if [[ "$(cat /proc/sys/net/ipv4/icmp_echo_ignore_all 2>/dev/null)" == "1" ]]; then
-    log "Входящий ping заблокирован"
-  elif $BLOCK_PING; then
-    warn "icmp_echo_ignore_all не применился (возможно, LXC) — проверь после перезагрузки"
+  # --- Ping ---
+  if $BLOCK_PING; then
+    sysctl -w net.ipv4.icmp_echo_ignore_all=1 >/dev/null 2>&1 || true
+    if [[ "$(cat /proc/sys/net/ipv4/icmp_echo_ignore_all 2>/dev/null || echo 0)" == "1" ]]; then
+      report "Ping (ICMP)" ok "заблокирован через sysctl"
+    elif command -v nft >/dev/null 2>&1; then
+      # фолбэк для контейнеров: тихий drop echo-request через nftables
+      nft list table inet vps-pingdrop >/dev/null 2>&1 || nft add table inet vps-pingdrop >/dev/null 2>&1 || true
+      nft list chain inet vps-pingdrop input >/dev/null 2>&1 \
+        || nft add chain inet vps-pingdrop input '{ type filter hook input priority -10; policy accept; }' >/dev/null 2>&1 || true
+      nft add rule inet vps-pingdrop input icmp type echo-request drop >/dev/null 2>&1 || true
+      if nft list chain inet vps-pingdrop input 2>/dev/null | grep -q 'echo-request drop'; then
+        setup_pingdrop_unit
+        report "Ping (ICMP)" warn "sysctl запрещён контейнером — echo-request режется nftables (переживает ребут через юнит vps-pingdrop)"
+      else
+        report "Ping (ICMP)" fail "ни sysctl, ни nftables не сработали — сервер отвечает на ping (проверь панель хостера)"
+      fi
+    else
+      report "Ping (ICMP)" fail "sysctl не применился, nftables нет — сервер отвечает на ping"
+    fi
+  else
+    # сбросить живое значение и наши следы, чтобы выбор «разрешить» сработал сразу
+    sysctl -w net.ipv4.icmp_echo_ignore_all=0 >/dev/null 2>&1 || true
+    rm -f /etc/sysctl.d/99-block-ping.conf
+    if nft list table inet vps-pingdrop >/dev/null 2>&1; then
+      nft delete table inet vps-pingdrop >/dev/null 2>&1 || true
+    fi
+    systemctl disable --now vps-pingdrop.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/vps-pingdrop.service
+    if [[ "$(cat /proc/sys/net/ipv4/icmp_echo_ignore_all 2>/dev/null || echo 0)" == "0" ]] \
+       && ! nft list ruleset 2>/dev/null | grep -q 'echo-request drop'; then
+      report "Ping (ICMP)" ok "разрешён (как и выбрано)"
+    else
+      report "Ping (ICMP)" warn "всё ещё блокируется (настройка хостера?) — проверь после перезагрузки"
+    fi
+  fi
+
+  if $LEGACY_CLEANED; then
+    warn "Из /etc/sysctl.conf удалён тюнинг от старой версии скрипта — после работы скрипта сделай reboot"
   fi
 }
 
+# персистентный юнит для nft-фолбэка ping (на случай, если хостер не поднимает наши правила)
+setup_pingdrop_unit() {
+  cat > /etc/systemd/system/vps-pingdrop.service <<EOF
+[Unit]
+Description=Drop incoming ICMP echo (fallback where sysctl is blocked)
+After=network-pre.target
+Before=network.target
+
+[Service]
+Type=oneshot
+ExecStart=$(command -v nft) add table inet vps-pingdrop
+ExecStart=$(command -v nft) add chain inet vps-pingdrop input "{ type filter hook input priority -10; policy accept; }"
+ExecStart=$(command -v nft) add rule inet vps-pingdrop input icmp type echo-request drop
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl enable vps-pingdrop.service >/dev/null 2>&1 || true
+}
+
 system_limits() {
-  step "Системные лимиты и журнал"
   mkdir -p /etc/security/limits.d
   cat > /etc/security/limits.d/99-increase-limits.conf <<'EOF'
 * soft nofile 1048576
@@ -545,10 +791,429 @@ EOF
 SystemMaxUse=200M
 EOF
   systemctl restart systemd-journald 2>/dev/null || true
-  log "Лимиты и размер журнала настроены"
+  if [[ -s /etc/security/limits.d/99-increase-limits.conf ]]; then
+    report "Лимиты и журнал" ok "nofile 1M, журнал до 200M"
+  else
+    report "Лимиты и журнал" fail "конфиг не записался"
+    return 1
+  fi
 }
 
-# Сканирование слушающих портов → LISTEN_* (не меняет ничего)
+#----------------------- SSH ------------------------------------
+# Проверка эффективной конфигурации sshd (то, что реально действует)
+sshd_effective() { # sshd_effective passwordauthentication → no
+  timeout 5 sshd -T 2>/dev/null | awk -v k="$1" 'tolower($1)==tolower(k){print $2; exit}'
+}
+
+configure_ssh() {
+  if $NO_SSH; then
+    report "SSH" ok "не трогали (--no-ssh)"
+    return 0
+  fi
+  mkdir -p /etc/ssh/sshd_config.d
+  if [[ -f "$SSH_LEGACY_CFG" ]]; then
+    rm -f "$SSH_LEGACY_CFG"
+    log "Удалён старый 99-hardening.conf (заменён на 00-hardening.conf — у него приоритет выше cloud-init-настроек)"
+  fi
+
+  local target_port="${SSH_PORT:-$CURR_SSH_PORT}"
+  local pin_port=false
+  if [[ -n "$SSH_PORT" || "$CURR_SSH_SOURCE" != "default" ]]; then
+    pin_port=true
+  fi
+
+  # новый порт не должен быть занят кем-то другим
+  if [[ -n "$SSH_PORT" && "$SSH_PORT" != "$CURR_SSH_PORT" ]] && port_is_listening "$SSH_PORT"; then
+    report "SSH" fail "порт $SSH_PORT уже занят другим сервисом — порт не меняю"
+    return 1
+  fi
+
+  # Политика доступа: ключ должен быть у того, кому оставляем вход
+  local admin_key=false root_key=false
+  [[ -n "$ADMIN_USER" && -s "/home/${ADMIN_USER}/.ssh/authorized_keys" ]] && admin_key=true
+  [[ -s /root/.ssh/authorized_keys ]] && root_key=true
+
+  local conf=""
+  if $pin_port; then
+    conf+="Port ${target_port}"$'\n'
+  fi
+  if $HARDEN_SSH; then
+    conf+="X11Forwarding no"$'\n'
+    conf+="AllowAgentForwarding no"$'\n'
+    conf+="MaxAuthTries 3"$'\n'
+    conf+="LoginGraceTime 20"$'\n'
+    conf+="ClientAliveInterval 120"$'\n'
+    conf+="ClientAliveCountMax 3"$'\n'
+  fi
+  local disabled=false
+  if $DISABLE_SSH_PASSWORD; then
+    if $admin_key; then
+      conf+="PasswordAuthentication no"$'\n'
+      conf+="KbdInteractiveAuthentication no"$'\n'
+      conf+="PermitRootLogin no"$'\n'
+      disabled=true
+    elif $root_key; then
+      conf+="PasswordAuthentication no"$'\n'
+      conf+="KbdInteractiveAuthentication no"$'\n'
+      conf+="PermitRootLogin prohibit-password"$'\n'
+      disabled=true
+      warn "У $ADMIN_USER нет ключа — root остаётся доступен по ключу (иначе потерял бы доступ)"
+    else
+      warn "Ключей на сервере нет — вход по паролю НЕ отключаю (иначе потеряешь доступ)"
+    fi
+  fi
+
+  # запись с бэкапом и откатом: провал валидации не портит рабочий конфиг
+  local backup=""
+  if [[ -f "$SSH_HARDENING_CFG" ]]; then
+    backup="$(mktemp)"
+    cp "$SSH_HARDENING_CFG" "$backup"
+  fi
+  printf '%s' "$conf" > "$SSH_HARDENING_CFG"
+  if ! sshd -t 2>/tmp/vps-sshd-t.err; then
+    if [[ -n "$backup" ]]; then mv "$backup" "$SSH_HARDENING_CFG"; else rm -f "$SSH_HARDENING_CFG"; fi
+    report "SSH" fail "новый конфиг не прошёл sshd -t, предыдущий восстановлен: $(tail -1 /tmp/vps-sshd-t.err 2>/dev/null || echo '?')"
+    return 1
+  fi
+
+  # socket activation: через сокет порт из sshd_config не действует
+  local socket_mode=false
+  if systemctl is-enabled ssh.socket >/dev/null 2>&1 || systemctl is-active ssh.socket >/dev/null 2>&1; then
+    socket_mode=true
+    if $pin_port; then
+      mkdir -p /etc/systemd/system/ssh.socket.d
+      printf '[Socket]\nListenStream=\nListenStream=%s\n' "$target_port" > /etc/systemd/system/ssh.socket.d/00-port.conf
+      systemctl daemon-reload 2>/dev/null || true
+    fi
+  fi
+
+  if $socket_mode; then
+    systemctl restart ssh.socket 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+  else
+    if ! systemctl restart ssh 2>/dev/null; then
+      if ! systemctl restart sshd 2>/dev/null; then
+        if [[ -n "$backup" ]]; then mv "$backup" "$SSH_HARDENING_CFG"; fi
+        systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+        report "SSH" fail "sshd не перезапустился — конфиг откачен к предыдущему"
+        return 1
+      fi
+    fi
+  fi
+  [[ -n "$backup" ]] && rm -f "$backup"
+
+  # проверка по факту: слушаем нужный порт? политика применилась?
+  sleep 1
+  local ok=true
+  if ! port_is_listening "$target_port"; then
+    report "SSH порт" fail "sshd не слушает $target_port (смена порта не сработала — проверь ssh.socket/конфиг)"
+    ok=false
+  else
+    report "SSH порт" ok "$target_port (слушается)"
+  fi
+  if $disabled; then
+    local eff_pa
+    eff_pa="$(sshd_effective passwordauthentication)"
+    if [[ "$eff_pa" == "no" ]]; then
+      report "Вход по паролю" ok "отключён (проверено в действующем конфиге)"
+    else
+      report "Вход по паролю" fail "просили отключить, а действует: $eff_pa — вероятно, настройки хостера перекрывают наши"
+      ok=false
+    fi
+  fi
+  $ok || return 1
+}
+
+setup_fail2ban() {
+  if $SKIP_FAIL2BAN; then
+    if command -v fail2ban-client >/dev/null 2>&1; then
+      report "Fail2ban" warn "стоит на сервере, но по флагу --no-fail2ban я его конфиг не трогаю"
+    else
+      report "Fail2ban" ok "пропущено (--no-fail2ban)"
+    fi
+    return 0
+  fi
+  local port="${SSH_PORT:-$CURR_SSH_PORT}"
+  mkdir -p /etc/fail2ban
+  if [[ -f /etc/fail2ban/jail.local ]]; then
+    cp /etc/fail2ban/jail.local "/etc/fail2ban/jail.local.bak.$(date +%Y%m%d%H%M%S)"
+  fi
+  cat > /etc/fail2ban/jail.local <<EOF
+[DEFAULT]
+bantime  = 1h
+findtime = 10m
+maxretry = 5
+bantime.increment = true
+bantime.factor    = 2
+bantime.maxtime   = 1w
+ignoreip = 127.0.0.1/8 ::1
+
+[sshd]
+enabled  = true
+port     = ${port}
+backend  = systemd
+maxretry = 4
+EOF
+  systemctl restart fail2ban 2>/dev/null || true
+  systemctl enable fail2ban >/dev/null 2>&1 || true
+  if fail2ban-client status sshd >/dev/null 2>&1; then
+    report "Fail2ban" ok "jail sshd активен (порт $port, бан 1ч → до 1 недели)"
+  else
+    report "Fail2ban" fail "jail sshd не поднялся — смотри journalctl -u fail2ban"
+    return 1
+  fi
+}
+
+setup_firewall() {
+  if $NO_FIREWALL; then
+    report "Фаервол" ok "не трогали (--no-firewall) — UFW и порты как были"
+    return 0
+  fi
+  local ssh_p="${SSH_PORT:-$CURR_SSH_PORT}"
+
+  # rate-limit SSH: если на порту уже есть allow — убираем (первое совпадение
+  # в UFW побеждает, allow отменил бы лимит)
+  if ufw status 2>/dev/null | grep -qE "^${ssh_p}/tcp[[:space:]]+ALLOW"; then
+    ufw delete allow "${ssh_p}/tcp" >/dev/null 2>&1 || true
+  fi
+  ufw limit "${ssh_p}/tcp" comment 'SSH' >/dev/null
+
+  # при смене порта правило старого порта больше не нужно
+  # (sshd уже переключён и подтверждён — окно блокировки отсутствует)
+  if [[ "$ssh_p" != "22" ]]; then
+    ufw delete limit 22/tcp >/dev/null 2>&1 || true
+    ufw delete allow 22/tcp >/dev/null 2>&1 || true
+  fi
+
+  # идемпотентность: сносим правила прошлого прогона и добавляем текущие
+  mkdir -p "$STATE_DIR"
+  if [[ -f "$STATE_DIR/ufw-node.rules" ]]; then
+    local old
+    while read -r old; do
+      [[ -z "$old" ]] && continue
+      ufw delete allow "$old" >/dev/null 2>&1 || true
+    done < "$STATE_DIR/ufw-node.rules"
+  fi
+
+  local i p pr specs_file="$STATE_DIR/ufw-node.rules.new"
+  : > "$specs_file"
+  for i in "${!PORTS_NUM[@]}"; do
+    p="${PORTS_NUM[$i]}"; pr="${PORTS_PROTO[$i]}"
+    case "$pr" in
+      tcp)  ufw allow "${p}/tcp" comment 'node' >/dev/null; echo "${p}/tcp" >> "$specs_file" ;;
+      udp)  ufw allow "${p}/udp" comment 'node' >/dev/null; echo "${p}/udp" >> "$specs_file" ;;
+      both) ufw allow "${p}/tcp" comment 'node' >/dev/null
+            ufw allow "${p}/udp" comment 'node' >/dev/null
+            echo "${p}/tcp" >> "$specs_file"; echo "${p}/udp" >> "$specs_file" ;;
+    esac
+    log "Открыт порт: $p/$pr"
+  done
+  if (( ${#PORTS_NUM[@]} == 0 )); then
+    warn "Порты не открывались. Для сервисов потом: ufw allow ПОРТ/tcp (или /udp)"
+  fi
+  mv -f "$specs_file" "$STATE_DIR/ufw-node.rules"
+
+  ufw default deny incoming
+  ufw default allow outgoing
+  ufw --force enable >/dev/null
+
+  # проверка по факту
+  if ! ufw status 2>/dev/null | head -n1 | grep -q "Status: active"; then
+    report "Фаервол UFW" fail "ufw не активировался"
+    return 1
+  fi
+  if ! ufw status 2>/dev/null | grep -qE "^${ssh_p}/tcp[[:space:]]+(LIMIT|ALLOW)"; then
+    report "Фаервол UFW" fail "правило для SSH-порта $ssh_p не найдено в ufw status"
+    return 1
+  fi
+  report "Фаервол UFW" ok "active, SSH $ssh_p под rate-limit, node-портов: ${#PORTS_NUM[@]}"
+}
+
+setup_swap() {
+  if [[ -n "$(swapon --show 2>/dev/null)" ]]; then
+    report "Swap" ok "уже настроен: $(swapon --show --noheadings 2>/dev/null | awk '{print $1, $3}' | tr '\n' ' ')"
+    return 0
+  fi
+  local ram_mb size_mb
+  ram_mb=$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo)
+  if (( ram_mb <= 2000 )); then size_mb=2048; else size_mb=1024; fi
+  if ! fallocate -l "${size_mb}M" /swapfile 2>/dev/null; then
+    dd if=/dev/zero of=/swapfile bs=1M count="$size_mb" status=none
+  fi
+  chmod 600 /swapfile
+  if ! mkswap /swapfile >/dev/null 2>&1 || ! swapon /swapfile 2>/dev/null; then
+    # откат: не оставляем мёртвый файл и запись в fstab
+    swapoff /swapfile 2>/dev/null || true
+    rm -f /swapfile
+    sed -i '\|^/swapfile[[:space:]]|d' /etc/fstab
+    report "Swap" fail "$(virt_kind): swapon запрещён (типично для контейнеров) — файл и запись в fstab откачены. Обычно это не критично"
+    return 1
+  fi
+  grep -qE '^/swapfile[[:space:]]' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  report "Swap" ok "${size_mb}M активен"
+}
+
+cleanup() {
+  if command -v snap >/dev/null 2>&1; then
+    local s
+    while read -r s; do snap remove --purge "$s" >/dev/null 2>&1 || true; done \
+      < <(snap list 2>/dev/null | awk 'NR>1{print $1}')
+    if aptget purge snapd >/dev/null 2>&1; then
+      rm -rf /snap /var/snap /var/lib/snapd ~/snap 2>/dev/null || true
+      log "Snap удалён"
+    else
+      warn "snapd не удалось вычистить (занят?) — каталоги не трогаю"
+    fi
+  fi
+  if $PURGE_CLOUDINIT && command -v cloud-init >/dev/null 2>&1; then
+    aptget purge cloud-init >/dev/null 2>&1 || true
+    rm -rf /etc/cloud
+    log "cloud-init удалён"
+  fi
+  pro config set apt_news=false >/dev/null 2>&1 || true
+  [[ -f /etc/default/motd-news ]] && sed -i 's/^ENABLED=.*/ENABLED=0/' /etc/default/motd-news
+  report "Чистка" ok "snap/motd${PURGE_CLOUDINIT:+, cloud-init}"
+}
+
+install_docker() {
+  if ! $INSTALL_DOCKER; then
+    report "Docker" ok "пропущено (--no-docker)"
+    return 0
+  fi
+  if ! command -v docker >/dev/null 2>&1; then
+    local tmpf
+    tmpf="$(mktemp)"
+    if ! curl -fsSL https://get.docker.com -o "$tmpf"; then
+      rm -f "$tmpf"
+      report "Docker" fail "не удалось скачать установщик"
+      return 1
+    fi
+    sh "$tmpf" >/dev/null
+    rm -f "$tmpf"
+  fi
+  systemctl enable --now docker >/dev/null 2>&1 || true
+  if docker info >/dev/null 2>&1; then
+    report "Docker" ok "$(docker --version 2>/dev/null | awk '{print $3}' | tr -d ,) — демон жив"
+  else
+    report "Docker" fail "установлен, но демон не отвечает — journalctl -u docker"
+    return 1
+  fi
+  if [[ -n "$ADMIN_USER" ]] && id "$ADMIN_USER" &>/dev/null; then
+    if ! id -nG "$ADMIN_USER" | grep -qw docker; then
+      usermod -aG docker "$ADMIN_USER"
+      log "$ADMIN_USER добавлен в группу docker (вступит в силу при следующем входе)"
+    fi
+  fi
+}
+
+summary() {
+  local ipaddr ssh_p
+  ssh_p="$(detect_ssh_port)"
+  ipaddr="$(curl -s4 -m 5 https://api.ipify.org || echo 'не удалось определить')"
+  echo -e "\n${C}════════════════════ ИТОГ ════════════════════${N}"
+  echo -e "Хостнейм:     $(hostname)"
+  echo -e "IP:           $ipaddr"
+  echo -e "SSH порт:     $ssh_p"
+  if [[ -n "$ADMIN_USER" ]]; then
+    echo -e "Пользователь: $ADMIN_USER (sudo без пароля)"
+  fi
+  echo -e "Вход:         ssh -p $ssh_p ${ADMIN_USER:-root}@$ipaddr"
+  if [[ -n "$GENERATED_KEY_PATH" ]]; then
+    echo -e "Приват.ключ:  $GENERATED_KEY_PATH — скачай и удали: shred -u $GENERATED_KEY_PATH"
+  fi
+  echo -e "Вход паролем: $(sshd_effective passwordauthentication || echo '?') (действующий sshd)"
+  echo -e "BBR:          $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '?')"
+  echo -e "Ping (ICMP):  $( [[ $(cat /proc/sys/net/ipv4/icmp_echo_ignore_all 2>/dev/null || echo 0) -eq 1 ]] && echo 'заблокирован' || echo 'sysctl разрешён (возможен nft-фолбэк)' )"
+  echo -e "IPv6:         $( [[ $(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 0) -eq 1 ]] && echo 'отключён' || echo 'включён' )"
+  echo -e "Fail2ban:     $(fail2ban-client status sshd >/dev/null 2>&1 && echo 'активен' || echo 'выключен')"
+  echo -e "UFW:          $(ufw status 2>/dev/null | head -n1 | awk '{print $2}')"
+  echo -e "Docker:       $(command -v docker >/dev/null 2>&1 && (docker info >/dev/null 2>&1 && docker --version || echo 'демон не отвечает') || echo 'нет')"
+  echo -e "Лог:          ${LOG_FILE:-нет}"
+  if [[ -f /var/run/reboot-required ]]; then
+    echo -e "${Y}Внимание:    требуется перезагрузка (reboot) — обновились системные компоненты${N}"
+  fi
+  if $LEGACY_CLEANED; then
+    echo -e "${Y}Внимание:    удалён старый тюнинг из /etc/sysctl.conf — рекомендуется reboot${N}"
+  fi
+  echo -e "${C}══════════════════════════════════════════════${N}"
+}
+
+#----------------------- DOCTOR (только проверка) ---------------
+doctor_checks() {
+  local cc q v6 ping_st eff_pa eff_prl swap_st
+  cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '?')"
+  q="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo '?')"
+  if [[ "$cc" == "bbr" && "$q" == "fq" ]]; then report "BBR + fq" ok
+  elif [[ "$cc" == "bbr" ]]; then report "BBR + fq" warn "bbr включён, qdisc=$q"
+  else report "BBR + fq" fail "congestion=$cc — BBR не работает"; fi
+
+  v6="$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 0)"
+  if [[ "$v6" == "1" ]]; then report "IPv6" ok "отключён"
+  elif [[ -f /etc/sysctl.d/99-disable-ipv6.conf ]]; then
+    report "IPv6" warn "должен быть отключён конфигом, но сейчас включён — проверь после перезагрузки или в панели хостера"
+  else report "IPv6" ok "включён"; fi
+
+  ping_st="$(cat /proc/sys/net/ipv4/icmp_echo_ignore_all 2>/dev/null || echo 0)"
+  if [[ "$ping_st" == "1" ]]; then report "Ping (ICMP)" ok "заблокирован (sysctl)"
+  elif nft list ruleset 2>/dev/null | grep -q 'echo-request drop'; then
+    report "Ping (ICMP)" ok "заблокирован (nftables-фолбэк)"
+  elif [[ -f /etc/sysctl.d/99-block-ping.conf ]]; then
+    report "Ping (ICMP)" warn "должен блокироваться конфигом, но сейчас разрешён — проверь после перезагрузки или в панели хостера"
+  else report "Ping (ICMP)" ok "разрешён"; fi
+
+  local tz ntp
+  tz="$(timedatectl show -p Timezone --value 2>/dev/null || echo '?')"
+  ntp="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo no)"
+  if [[ "$ntp" == "yes" ]]; then report "Время" ok "$tz, синхронизировано"
+  else report "Время" warn "$tz, NTP не синхронизирован"; fi
+
+  if ufw status 2>/dev/null | head -n1 | grep -q "active"; then
+    local ssh_p
+    ssh_p="$(detect_ssh_port)"
+    if ufw status 2>/dev/null | grep -qE "^${ssh_p}/tcp"; then
+      report "Фаервол UFW" ok "active, правило для SSH $ssh_p есть"
+    else
+      report "Фаервол UFW" fail "active, но для SSH-порта $ssh_p правила нет — вход может быть заблокирован!"
+    fi
+  elif command -v ufw >/dev/null 2>&1; then report "Фаервол UFW" warn "установлен, но не активен"
+  else report "Фаервол UFW" ok "не установлен"; fi
+
+  if fail2ban-client status sshd >/dev/null 2>&1; then
+    local banned
+    banned="$(fail2ban-client status sshd 2>/dev/null | awk -F': ' '/Currently banned/{print $2}')"
+    report "Fail2ban" ok "jail sshd активен, в бане: ${banned:-0}"
+  elif command -v fail2ban-client >/dev/null 2>&1; then
+    report "Fail2ban" fail "установлен, но jail sshd не работает — journalctl -u fail2ban"
+  else report "Fail2ban" ok "не установлен"; fi
+
+  swap_st="$(swapon --show --noheadings 2>/dev/null | awk '{print $1, $3}' | tr '\n' ' ')"
+  if [[ -n "$swap_st" ]]; then report "Swap" ok "$swap_st"
+  else report "Swap" warn "отсутствует (на контейнерах может быть запрещён)"; fi
+
+  if command -v docker >/dev/null 2>&1; then
+    if docker info >/dev/null 2>&1; then report "Docker" ok "$(docker --version | awk '{print $3}' | tr -d ,)"
+    else report "Docker" fail "демон не отвечает — journalctl -u docker"; fi
+  else report "Docker" ok "не установлен"; fi
+
+  if [[ -f "$SSH_HARDENING_CFG" ]]; then
+    eff_pa="$(sshd_effective passwordauthentication || echo '?')"
+    eff_prl="$(sshd_effective permitrootlogin || echo '?')"
+    local file_pa
+    file_pa="$(awk 'tolower($1)=="passwordauthentication"{print $2}' "$SSH_HARDENING_CFG" | head -n1)"
+    if [[ -n "$file_pa" && "$file_pa" != "$eff_pa" ]]; then
+      report "SSH конфиг" fail "00-hardening.conf требует PasswordAuthentication $file_pa, а действует $eff_pa — настройки хостера перекрывают наши"
+    else
+      report "SSH конфиг" ok "port $(detect_ssh_port), passwordauthentication=$eff_pa, permitrootlogin=$eff_prl"
+    fi
+  else
+    report "SSH конфиг" ok "харденинг не применялся (00-hardening.conf отсутствует)"
+  fi
+
+  if systemctl is-active ssh.socket >/dev/null 2>&1; then
+    report "SSH socket" ok "ssh.socket активен (порт задаёт сокет, не sshd_config)"
+  fi
+}
+
+#----------------------- АУДИТ ПОРТОВ ---------------------------
 port_survey_scan() {
   LISTEN_NET=(); LISTEN_PORT=(); LISTEN_ADDR=(); LISTEN_PROC=()
   local -a f
@@ -666,7 +1331,7 @@ collect_external_ports() {
   done
 }
 
-# Сопоставление «слушается» ↔ «открываем». Предупреждения — по процессам, не по портам.
+# Сопоставление «слушается» ↔ «открываем». Предупреждения — по процессам.
 audit_ports() {
   local ssh_p="${SSH_PORT:-$CURR_SSH_PORT}"
   local -A miss=()
@@ -736,213 +1401,6 @@ audit_ports() {
   done
 }
 
-setup_fail2ban() {
-  step "Fail2ban"
-  local port="${SSH_PORT:-$CURR_SSH_PORT}"
-  cat > /etc/fail2ban/jail.local <<EOF
-[DEFAULT]
-bantime  = 1h
-findtime = 10m
-maxretry = 5
-bantime.increment = true
-bantime.factor    = 2
-bantime.maxtime   = 1w
-ignoreip = 127.0.0.1/8 ::1
-
-[sshd]
-enabled  = true
-port     = ${port}
-backend  = systemd
-maxretry = 4
-EOF
-  systemctl restart fail2ban
-  systemctl enable fail2ban >/dev/null 2>&1
-  log "Fail2ban: бан после 4 неудачных входов, эскалация до 1 недели (порт $port)"
-}
-
-setup_firewall() {
-  if $NO_FIREWALL; then
-    log "Фаервол: не трогаю — правила и UFW остаются как есть"
-    return 0
-  fi
-  step "Фаервол UFW"
-  local ssh_p="${SSH_PORT:-$CURR_SSH_PORT}"
-  ufw limit "${ssh_p}/tcp" comment 'SSH' >/dev/null
-
-  # При смене порта старое правило для 22 убираем
-  if [[ "$ssh_p" != "22" ]] && ufw status | grep -qE '^22/tcp'; then
-    ufw delete limit 22/tcp >/dev/null 2>&1 || true
-    ufw delete allow 22/tcp >/dev/null 2>&1 || true
-    log "Старое правило для порта 22 убрано из UFW"
-  fi
-
-  local i p pr
-  for i in "${!PORTS_NUM[@]}"; do
-    p="${PORTS_NUM[$i]}"; pr="${PORTS_PROTO[$i]}"
-    case "$pr" in
-      tcp)  ufw allow "${p}/tcp" comment 'node' >/dev/null ;;
-      udp)  ufw allow "${p}/udp" comment 'node' >/dev/null ;;
-      both) ufw allow "${p}/tcp" comment 'node' >/dev/null
-            ufw allow "${p}/udp" comment 'node' >/dev/null ;;
-    esac
-    log "Открыт порт: $p/$pr"
-  done
-  if (( ${#PORTS_NUM[@]} == 0 )); then
-    warn "Порты не открыты. Для сервисов потом: ufw allow ПОРТ/tcp (или /udp)"
-  fi
-
-  ufw default deny incoming
-  ufw default allow outgoing
-  ufw --force enable >/dev/null
-  ufw status verbose | sed 's/^/    /'
-}
-
-configure_ssh() {
-  if $NO_SSH; then
-    log "SSH: конфиг sshd не трогаю"
-    return 0
-  fi
-  step "SSH"
-  local cfg=/etc/ssh/sshd_config.d/99-hardening.conf
-  mkdir -p /etc/ssh/sshd_config.d
-
-  local conf=""
-  [[ -n "$SSH_PORT" ]] && conf+="Port ${SSH_PORT}"$'\n'
-  if $HARDEN_SSH; then
-    conf+="X11Forwarding no"$'\n'
-    conf+="AllowAgentForwarding no"$'\n'
-    conf+="MaxAuthTries 3"$'\n'
-    conf+="LoginGraceTime 20"$'\n'
-    conf+="ClientAliveInterval 120"$'\n'
-    conf+="ClientAliveCountMax 3"$'\n'
-  fi
-
-  # Ключи есть хотя бы у кого-то на сервере?
-  local have_keys=false d
-  for d in /root /home/*; do
-    [[ -s "$d/.ssh/authorized_keys" ]] && have_keys=true
-  done
-
-  if $DISABLE_SSH_PASSWORD; then
-    if $have_keys; then
-      conf+="PasswordAuthentication no"$'\n'
-      conf+="KbdInteractiveAuthentication no"$'\n'
-      if [[ -n "$ADMIN_USER" ]]; then
-        conf+="PermitRootLogin no"$'\n'
-        log "Вход по паролю отключён, root по SSH закрыт (работаем под $ADMIN_USER)"
-      else
-        conf+="PermitRootLogin prohibit-password"$'\n'
-        log "Вход по паролю отключён (root — только по ключу)"
-      fi
-    else
-      warn "Просили отключить пароли, но ключей на сервере нет — НЕ отключаю (иначе потеряешь доступ)"
-    fi
-  fi
-
-  printf '%s' "$conf" > "$cfg"
-  sshd -t || die "Конфиг sshd не проходит проверку — смотри $cfg"
-  systemctl restart ssh 2>/dev/null || systemctl restart sshd
-
-  local eport="${SSH_PORT:-$CURR_SSH_PORT}"
-  echo
-  warn "ВАЖНО: проверь вход В НОВОМ окне терминала, не закрывая текущую сессию:"
-  warn "  ssh -p ${eport} ${ADMIN_USER:-root}@<IP сервера>"
-}
-
-setup_swap() {
-  step "Swap"
-  if [[ -n "$(swapon --show 2>/dev/null)" ]]; then
-    log "Swap уже настроен:"; swapon --show | sed 's/^/    /'
-    return 0
-  fi
-  local ram_mb size_mb
-  ram_mb=$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo)
-  if (( ram_mb <= 2000 )); then size_mb=2048; else size_mb=1024; fi
-  log "Создаю swap ${size_mb}M..."
-  fallocate -l "${size_mb}M" /swapfile 2>/dev/null \
-    || dd if=/dev/zero of=/swapfile bs=1M count="$size_mb" status=none
-  chmod 600 /swapfile
-  mkswap /swapfile >/dev/null
-  swapon /swapfile
-  grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-  log "Swap активен"
-}
-
-cleanup() {
-  step "Очистка"
-  if command -v snap >/dev/null 2>&1; then
-    local s
-    while read -r s; do snap remove --purge "$s" >/dev/null 2>&1 || true; done \
-      < <(snap list 2>/dev/null | awk 'NR>1{print $1}')
-    apt-get purge -y snapd >/dev/null 2>&1 || true
-    rm -rf /snap /var/snap /var/lib/snapd ~/snap 2>/dev/null || true
-    log "Snap удалён"
-  fi
-  if $PURGE_CLOUDINIT && command -v cloud-init >/dev/null 2>&1; then
-    apt-get purge -y cloud-init >/dev/null 2>&1 || true
-    rm -rf /etc/cloud
-    log "cloud-init удалён"
-  fi
-  pro config set apt_news=false >/dev/null 2>&1 || true
-  [[ -f /etc/default/motd-news ]] && sed -i 's/^ENABLED=.*/ENABLED=0/' /etc/default/motd-news
-  log "Чистка завершена"
-}
-
-install_docker() {
-  if ! $INSTALL_DOCKER; then return 0; fi
-  step "Docker"
-  if command -v docker >/dev/null 2>&1; then
-    log "Docker уже установлен: $(docker --version)"
-  else
-    curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
-    sh /tmp/get-docker.sh
-    rm -f /tmp/get-docker.sh
-    systemctl enable --now docker
-    log "Docker установлен: $(docker --version)"
-  fi
-  if [[ -n "$ADMIN_USER" ]] && id "$ADMIN_USER" &>/dev/null; then
-    if ! id -nG "$ADMIN_USER" | grep -qw docker; then
-      usermod -aG docker "$ADMIN_USER"
-      log "$ADMIN_USER добавлен в группу docker (вступит в силу при следующем входе)"
-    fi
-  fi
-}
-
-summary() {
-  local ipaddr ssh_p
-  ssh_p="${SSH_PORT:-$CURR_SSH_PORT}"
-  ipaddr="$(curl -s4 -m 5 https://api.ipify.org || echo 'не удалось определить')"
-  echo -e "\n${C}════════════════════ ИТОГ ════════════════════${N}"
-  echo -e "Хостнейм:     $(hostname)"
-  echo -e "IP:           $ipaddr"
-  echo -e "SSH порт:     $ssh_p"
-  if [[ -n "$ADMIN_USER" ]]; then
-    echo -e "Пользователь: $ADMIN_USER (sudo без пароля)"
-  fi
-  echo -e "Вход:         ssh -p $ssh_p ${ADMIN_USER:-root}@$ipaddr"
-  if [[ -n "$GENERATED_KEY_PATH" ]]; then
-    echo -e "Приват.ключ:  $GENERATED_KEY_PATH — скачай и удали: shred -u $GENERATED_KEY_PATH"
-  fi
-  if grep -qs '^PasswordAuthentication no' /etc/ssh/sshd_config.d/99-hardening.conf; then
-    echo -e "Вход паролем: выключен (только ключи)"
-  else
-    echo -e "Вход паролем: включён"
-  fi
-  echo -e "BBR:          $(sysctl -n net.ipv4.tcp_congestion_control)"
-  echo -e "Ping (ICMP):  $( [[ $(cat /proc/sys/net/ipv4/icmp_echo_ignore_all) -eq 1 ]] && echo 'заблокирован' || echo 'разрешён' )"
-  echo -e "IPv6:         $( [[ $(cat /proc/sys/net/ipv6/conf/all/disable_ipv6) -eq 1 ]] && echo 'отключён' || echo 'включён' )"
-  echo -e "Fail2ban:     $(systemctl is-active fail2ban 2>/dev/null || echo 'выключен')"
-  echo -e "UFW:          $(ufw status 2>/dev/null | head -n1 | awk '{print $2}')"
-  echo -e "Docker:       $(command -v docker >/dev/null 2>&1 && docker --version || echo 'нет')"
-  if [[ -f /var/run/reboot-required ]]; then
-    echo -e "${Y}Внимание:    требуется перезагрузка (reboot) — обновились системные компоненты${N}"
-  fi
-  if $LEGACY_CLEANED; then
-    echo -e "${Y}Внимание:    удалён старый тюнинг из /etc/sysctl.conf — рекомендуется reboot${N}"
-  fi
-  echo -e "${C}══════════════════════════════════════════════${N}"
-}
-
 #----------------------- ВАЛИДАЦИЯ ОТВЕТОВ ----------------------
 validate_settings() {
   if $NO_SSH; then
@@ -959,6 +1417,7 @@ validate_settings() {
   fi
   if [[ -n "$SSH_PORT" ]]; then
     is_valid_port "$SSH_PORT" || die "Порт SSH «$SSH_PORT» — не число из диапазона 1–65535"
+    SSH_PORT="$((10#$SSH_PORT))"
     if [[ "$SSH_PORT" == "$CURR_SSH_PORT" ]]; then
       warn "Порт SSH совпадает с текущим — оставляю как есть"
       SSH_PORT=""
@@ -1067,6 +1526,7 @@ wizard_questions() {
       get_answer _p "Порт SSH (пусто — оставить $CURR_SSH_PORT)" ""
       if [[ -z "$_p" ]]; then break; fi
       if ! is_valid_port "$_p"; then warn "Число от 1 до 65535"; continue; fi
+      _p="$((10#$_p))"
       if [[ "$_p" != "$CURR_SSH_PORT" ]]; then SSH_PORT="$_p"; fi
       break
     done
@@ -1180,7 +1640,7 @@ wizard_questions() {
     ask_yes "Установить Docker?" y || INSTALL_DOCKER=false
   fi
   if ! flag_seen "purge-cloudinit"; then
-    ask_yes "Удалить cloud-init? (только если VPS без него обходится)" n && PURGE_CLOUDINIT=true
+    ask_yes "Удалить cloud-init? (если хостер раздаёт через него сеть/порт SSH — НЕ надо)" n && PURGE_CLOUDINIT=true
   fi
   if ! flag_seen "disable-ssh-password" && ! $NO_SSH; then
     local keys_ahead=false
@@ -1205,7 +1665,7 @@ show_plan() {
   if [[ -z "$specs" ]]; then specs="никакие"; fi
   echo
   echo -e "${C}──────────────── План настройки ────────────────${N}"
-  echo "  Обновление:    $( $NO_UPDATE && echo 'пропустить' || echo 'apt update/upgrade' )"
+  echo "  Обновление:    $( $NO_UPDATE && echo 'пропустить upgrade' || echo 'apt update/upgrade' )"
   echo "  Таймзона:      ${TIMEZONE:-не менять}"
   echo "  Hostname:      ${HOSTNAME_NEW:-оставить «$(hostname)»}"
   echo "  Порт SSH:      ${SSH_PORT:-остаётся $CURR_SSH_PORT}"
@@ -1241,6 +1701,15 @@ show_plan() {
 #----------------------- MAIN -----------------------------------
 main() {
   precheck
+  setup_log
+
+  if $DOCTOR; then
+    step "Doctor: проверка сервера (ничего не меняю)"
+    doctor_checks
+    print_report
+    if (( FAIL_COUNT > 0 )); then exit 1; fi
+    exit 0
+  fi
 
   if have_tty; then
     INTERACTIVE=true
@@ -1257,29 +1726,30 @@ main() {
     if ! ask_yes "Запускаем настройку?" y; then
       die "Отменено — ничего не менял."
     fi
-    WIZARD_RAN=true
   fi
 
   export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
-  update_system
-  install_base
-  set_time_and_host
-  create_admin
-  install_root_keys
-  install_admin_keys
-  tune_network
-  system_limits
-  if ! $WIZARD_RAN && ! $NO_FIREWALL; then
-    port_survey_print
-    audit_ports
-  fi
-  if ! $SKIP_FAIL2BAN; then setup_fail2ban; fi
-  setup_firewall
-  configure_ssh
-  if $SETUP_SWAP; then setup_swap; fi
-  cleanup
-  install_docker
+  run_step "Обновление системы" update_system
+  run_step "Базовые пакеты" install_base
+  run_step "Время и hostname" set_time_and_host
+  run_step "Пользователь admin" create_admin
+  run_step "SSH-ключи" install_root_keys
+  run_step "SSH-ключи admin" install_admin_keys
+  run_step "Сеть (BBR, IPv6, ping)" tune_network
+  run_step "Лимиты и журнал" system_limits
+  run_step "SSH" configure_ssh
+  run_step "Fail2ban" setup_fail2ban
+  run_step "Фаервол UFW" setup_firewall
+  if $SETUP_SWAP; then run_step "Swap" setup_swap; else report "Swap" ok "пропущено (--no-swap)"; fi
+  run_step "Чистка" cleanup
+  run_step "Docker" install_docker
+
+  print_report
   summary
+
+  if (( FAIL_COUNT > 0 )); then
+    exit 1
+  fi
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
