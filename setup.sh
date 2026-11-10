@@ -277,8 +277,9 @@ usage() {
                             Docker, fail2ban, swap, SSH…) и применяй пачкой
   wizard                    полный мастер настройки (как без аргументов)
 
-После настройки скрипт ставит команду vps: sudo vps открывает меню,
-sudo vps --doctor — проверку; обновление — пункт U в меню.
+При первом запуске скрипт ставит команду vps (даже если настройку
+не завершить): sudo vps открывает меню, sudo vps --doctor — проверку;
+обновление — пункт U в меню.
 
 Примеры:
   bash setup.sh                                          # мастер
@@ -2593,14 +2594,15 @@ menu_loop() {
 
 menu_main() {
   precheck
-  if ! have_tty; then
+  # терминал проверяем делом: /dev/tty может существовать, но не открываться
+  # (нет controlling tty) — тогда have_tty врёт, а exec честно падает
+  if ! exec 4>/dev/tty; then
     die "Меню требует интерактивного терминала — зайди по SSH и запусти: sudo vps"
   fi
   # выравнивание кириллицы: ${#var} должен считать символы, а не байты
   if ! [[ "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" == *UTF-8* ]]; then
     export LC_ALL=C.UTF-8
   fi
-  exec 4>/dev/tty
   menu_init_items
   menu_sync_state
   menu_loop
@@ -2682,8 +2684,11 @@ main() {
   fi
 
   setup_pipeline
+}
 
-  # команда управления: sudo vps открывает меню сервера
+# Поставить команду vps сразу при запуске скрипта — даже если настройку
+# не завершить или выйти из мастера. Идемпотентно; из установленной копии — скип.
+install_vps_command_logged() {
   if [[ "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo x)" != "$VPS_CMD" ]]; then
     if install_vps_command; then
       log "Установлена команда управления: ${C}sudo vps${N} — меню сервера в любой момент"
@@ -2699,8 +2704,8 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     set -- menu
   fi
   case "${1:-}" in
-    menu)   shift; parse "$@"; menu_main ;;
-    wizard) shift; parse "$@"; main ;;
-    *)      parse "$@"; main ;;
+    menu)   shift; parse "$@"; install_vps_command_logged; menu_main ;;
+    wizard) shift; parse "$@"; install_vps_command_logged; main ;;
+    *)      parse "$@"; install_vps_command_logged; main ;;
   esac
 fi
