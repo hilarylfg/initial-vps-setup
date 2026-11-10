@@ -2647,16 +2647,26 @@ setup_pipeline() {
   fi
 }
 
-# Скопировать текущий скрипт в /usr/local/bin/vps (идемпотентно).
-# Работает и для запуска через bash <(curl …) — источником служит $BASH_SOURCE.
+# Поставить текущий скрипт в /usr/local/bin/vps (идемпотентно).
+# Для обычного файла копируем его; для запуска через bash <(curl …) источник —
+# pipe /dev/fd/N, который bash к этому моменту уже дочитал (cat даст 0 байт),
+# поэтому качаем скрипт заново тем же адресом. Результат валидируется: пустышку
+# или битый файл не ставим никогда.
 install_vps_command() {
-  local src="${BASH_SOURCE[0]}" tmp
+  local src="${BASH_SOURCE[0]}" tmp ok=false
   mkdir -p /usr/local/bin
   if [[ "$(readlink -f "$src" 2>/dev/null)" == "$(readlink -f "$VPS_CMD" 2>/dev/null)" ]]; then
     return 0
   fi
   tmp="$(mktemp)" || return 1
-  if ! cat "$src" > "$tmp" 2>/dev/null; then
+  if [[ -f "$src" ]]; then
+    if cat "$src" > "$tmp" 2>/dev/null; then ok=true; fi
+  elif command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$SCRIPT_URL" -o "$tmp" 2>/dev/null && ok=true
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$tmp" "$SCRIPT_URL" 2>/dev/null && ok=true
+  fi
+  if ! $ok || [[ ! -s "$tmp" ]] || ! bash -n "$tmp" 2>/dev/null || ! grep -q '^VPS_CMD=' "$tmp"; then
     rm -f "$tmp"
     return 1
   fi
@@ -2693,7 +2703,8 @@ install_vps_command_logged() {
     if install_vps_command; then
       log "Установлена команда управления: ${C}sudo vps${N} — меню сервера в любой момент"
     else
-      warn "Не удалось установить $VPS_CMD (не критично)"
+      warn "Не удалось установить $VPS_CMD — поставь руками:"
+      warn "  curl -fsSL $SCRIPT_URL -o $VPS_CMD && chmod 755 $VPS_CMD"
     fi
   fi
 }
